@@ -3,6 +3,12 @@
 .venv/
 venv/
 
+# Data
+data/
+
+# Checkpoints
+checkpoints/
+
 # Python
 __pycache__/
 *.py[cod]

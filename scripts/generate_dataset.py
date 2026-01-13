@@ -275,14 +275,30 @@ def generate_dataset(verbose=False):
             viral_sequences, interacting_peptides, NON_INTERACTING_COUNT, verbose
         )
 
-        # Step 4: Output the dataset
-        # Interacting pairs: flag + human accession + peptide
-        for human_accession, peptide in sorted(interacting_pairs):
-            print(f"INTERACTING\t{human_accession}\t{peptide}")
-
-        # Non-interacting: flag + empty accession + peptide
-        for peptide in sorted(non_interacting):
-            print(f"NON_INTERACTING\t\t{peptide}")
+        # Step 4: Output the dataset as CSV
+        import csv
+        import os
+        
+        from pathlib import Path
+        
+        data_dir = Path(__file__).parent.parent / "data"
+        data_dir.mkdir(exist_ok=True)
+        output_path = data_dir / "dataset.csv"
+        
+        with open(output_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["label", "target", "sequence"])
+            
+            # Interacting pairs: label=1, target=human_accession, sequence=peptide
+            for human_accession, peptide in sorted(interacting_pairs):
+                writer.writerow([1, human_accession, peptide])
+            
+            # Non-interacting: label=0, no target, sequence=peptide
+            for peptide in sorted(non_interacting):
+                writer.writerow([0, "", peptide])
+        
+        if verbose:
+            print(f"Dataset written to {output_path}", file=sys.stderr)
 
         # Step 5: Print statistics if verbose
         if verbose:
