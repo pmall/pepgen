@@ -36,6 +36,9 @@ CHECKPOINTS_BASE = ROOT_DIR / "checkpoints"
 MAX_LENGTH = 20
 
 # Training presets optimized for different scenarios
+# Note: n_timesteps is kept low (50-100) because peptide sequences are small
+# (max 20 amino acids from a vocabulary of ~20 tokens). Unlike images with
+# millions of continuous pixels, discrete sequences need far fewer diffusion steps.
 PRESETS = {
     "small": {
         "description": "Fast experimentation, low memory (<4GB VRAM)",
@@ -45,7 +48,7 @@ PRESETS = {
         "dim": 128,
         "num_layers": 3,
         "num_heads": 4,
-        "n_timesteps": 500,
+        "n_timesteps": 20,
         "hybrid_loss_coeff": 0.0,
         "warmup_steps": 500,
     },
@@ -57,7 +60,7 @@ PRESETS = {
         "dim": 256,
         "num_layers": 4,
         "num_heads": 4,
-        "n_timesteps": 1000,
+        "n_timesteps": 50,
         "hybrid_loss_coeff": 0.001,
         "warmup_steps": 1000,
     },
@@ -69,7 +72,7 @@ PRESETS = {
         "dim": 512,
         "num_layers": 6,
         "num_heads": 8,
-        "n_timesteps": 1000,
+        "n_timesteps": 100,
         "hybrid_loss_coeff": 0.01,
         "warmup_steps": 2000,
     },
@@ -331,7 +334,7 @@ def add_arguments(parser):
     parser.add_argument("--dim", type=int, default=256, help="Model dimension")
     parser.add_argument("--num-layers", type=int, default=4, help="Transformer layers")
     parser.add_argument("--num-heads", type=int, default=4, help="Attention heads")
-    parser.add_argument("--n-timesteps", type=int, default=1000, help="Diffusion steps")
+    parser.add_argument("--n-timesteps", type=int, default=50, help="Diffusion steps (20-100 for peptides)")
     parser.add_argument("--hybrid-loss-coeff", type=float, default=0.001, help="VB loss weight")
 
     # Sampling

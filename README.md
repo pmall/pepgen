@@ -38,7 +38,7 @@ The model learns to denoise differently based on these conditions - it learns th
 #### Generation Phase: Guided Exploration
 
 1. Start with pure random noise (random amino acids at each position)
-2. Apply the learned denoising process iteratively (1000 steps by default)
+2. Apply the learned denoising process iteratively (50 steps by default)
 3. Condition on desired properties:
    - `label=1` → "Generate an interacting peptide"
    - `target=Q96C01` → "Make it interact with human protein Q96C01"
@@ -149,9 +149,9 @@ We provide three presets optimized for different scenarios:
 
 | Preset | Use Case | VRAM | Training Time (GPU) | Quality |
 |--------|----------|------|---------------------|---------|
-| `small` | Quick experiments, debugging | <4GB | ~20 min | Lower |
-| `medium` | **Recommended starting point** | ~6GB | ~1.5-3 hours | Good |
-| `large` | Best results, final training | >8GB | ~6-10 hours | Best |
+| `small` | Quick experiments, debugging | <4GB | ~10 min | Lower |
+| `medium` | **Recommended starting point** | ~6GB | ~30-60 min | Good |
+| `large` | Best results, final training | >8GB | ~2-4 hours | Best |
 
 ```bash
 uv run python scripts/train.py --preset small -v   # Fast experimentation
@@ -163,21 +163,21 @@ uv run python scripts/train.py --preset large -v   # Best quality
 
 #### Small Preset
 ```
-epochs: 50, batch_size: 32, lr: 2e-4, dim: 128, layers: 3, timesteps: 500
+epochs: 50, batch_size: 32, lr: 2e-4, dim: 128, layers: 3, timesteps: 20
 ```
 - **Purpose**: Rapid iteration, testing pipeline, low-resource environments
-- **Trade-offs**: May underfit, lower generation quality, but trains in ~1 hour on CPU
+- **Trade-offs**: May underfit, lower generation quality, but trains in ~10 min on GPU
 
 #### Medium Preset (Recommended)
 ```
-epochs: 200, batch_size: 64, lr: 1e-4, dim: 256, layers: 4, timesteps: 1000
+epochs: 200, batch_size: 64, lr: 1e-4, dim: 256, layers: 4, timesteps: 50
 ```
 - **Purpose**: Balanced quality and training time
 - **Trade-offs**: Good results for most use cases, reasonable training time
 
 #### Large Preset
 ```
-epochs: 500, batch_size: 128, lr: 5e-5, dim: 512, layers: 6, timesteps: 1000
+epochs: 500, batch_size: 128, lr: 5e-5, dim: 512, layers: 6, timesteps: 100
 ```
 - **Purpose**: Maximum quality for final model
 - **Trade-offs**: Slower training, requires more VRAM, risk of overfitting without validation
@@ -200,7 +200,7 @@ epochs: 500, batch_size: 128, lr: 5e-5, dim: 512, layers: 6, timesteps: 1000
 | `--dim` | 256 | Embedding dimension | Model capacity. 128 (small) → 512 (large). Affects VRAM linearly. |
 | `--num-layers` | 4 | Transformer layers | Depth. 3-6 typical. More layers = more capacity but slower. |
 | `--num-heads` | 4 | Attention heads | Should divide `dim` evenly. 4-8 typical. |
-| `--n-timesteps` | 1000 | Diffusion steps | More steps = better quality but slower generation. 500-1000 typical. |
+| `--n-timesteps` | 50 | Diffusion steps | For peptides (20 tokens), 20-100 steps is sufficient. Unlike images, discrete sequences don't need 1000 steps. |
 
 #### Loss Function
 
