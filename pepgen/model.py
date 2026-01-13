@@ -187,7 +187,7 @@ class D3PM(nn.Module):
         self.hybrid_loss_coeff = hybrid_loss_coeff
         self.eps = 1e-6
 
-        steps = torch.arange(n_timesteps + 1, dtype=torch.float64) / n_timesteps
+        steps = torch.arange(n_timesteps + 1, dtype=torch.float32) / n_timesteps
         alpha_bar = torch.cos((steps + 0.008) / 1.008 * torch.pi / 2)
         beta_t = torch.minimum(
             1 - alpha_bar[1:] / alpha_bar[:-1],
@@ -196,7 +196,7 @@ class D3PM(nn.Module):
 
         q_onestep_mats = []
         for beta in beta_t:
-            mat = torch.ones(num_classes, num_classes) * beta / num_classes
+            mat = torch.ones(num_classes, num_classes, dtype=torch.float32) * beta / num_classes
             mat.diagonal().fill_(1 - (num_classes - 1) * beta / num_classes)
             q_onestep_mats.append(mat)
 
@@ -240,7 +240,7 @@ class D3PM(nn.Module):
         softmaxed = F.softmax(x_0_logits, dim=-1)
 
         t_idx = (t - 2).clamp(min=0)
-        qmats2 = self.q_mats[t_idx].to(dtype=softmaxed.dtype)
+        qmats2 = self.q_mats[t_idx]
         fact2 = torch.einsum("b...c,bcd->b...d", softmaxed, qmats2)
 
         out = torch.log(fact1 + self.eps) + torch.log(fact2 + self.eps)
@@ -272,7 +272,7 @@ class D3PM(nn.Module):
             loss: Combined loss value
             info: Dict with individual loss components
         """
-        t = torch.randint(1, self.n_timesteps, (x.shape[0],), device=x.device)
+        t = torch.randint(1, self.n_timesteps + 1, (x.shape[0],), device=x.device)
 
         noise = torch.rand((*x.shape, self.num_classes), device=x.device)
         x_t = self.q_sample(x, t, noise)
@@ -332,7 +332,7 @@ class D3PM(nn.Module):
         """
         x = torch.randint(0, self.num_classes, (batch_size, seq_len), device=device)
 
-        for t in reversed(range(1, self.n_timesteps)):
+        for t in range(self.n_timesteps, 0, -1):
             t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
             x = self.p_sample(x, t_tensor, cond)
 

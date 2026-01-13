@@ -147,11 +147,11 @@ checkpoints/
 
 We provide three presets optimized for different scenarios:
 
-| Preset | Use Case | VRAM | Training Time | Quality |
-|--------|----------|------|---------------|---------|
-| `small` | Quick experiments, debugging, CPU training | <4GB | ~1 hour | Lower |
-| `medium` | **Recommended starting point** | ~6GB | ~4 hours | Good |
-| `large` | Best results, final training | >8GB | ~12 hours | Best |
+| Preset | Use Case | VRAM | Training Time (GPU) | Quality |
+|--------|----------|------|---------------------|---------|
+| `small` | Quick experiments, debugging | <4GB | ~20 min | Lower |
+| `medium` | **Recommended starting point** | ~6GB | ~1.5-3 hours | Good |
+| `large` | Best results, final training | >8GB | ~6-10 hours | Best |
 
 ```bash
 uv run python scripts/train.py --preset small -v   # Fast experimentation
