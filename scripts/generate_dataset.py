@@ -5,8 +5,9 @@ This script generates a dataset of interacting and non-interacting peptide seque
 from a PostgreSQL database containing protein-protein interaction data.
 
 The dataset contains:
-- INTERACTING: Human protein + viral peptide pairs from curated interactions
-- NON_INTERACTING: Randomly sampled 20aa sequences from viral proteins
+- INTERACTING: Human protein + viral peptide pairs from curated interactions (~2k)
+- NON_INTERACTING: Randomly sampled sequences from viral proteins (~500k)
+  The length distribution (4-20 AA) matches the interacting sequences to prevent bias.
 
 Database Schema Overview:
 -------------------------
@@ -43,17 +44,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Peptide length constraints for interacting sequences
+# Peptide length constraints
 # Only peptides between 4 and 20 amino acids are considered valid
 MIN_PEPTIDE_LENGTH = 4
 MAX_PEPTIDE_LENGTH = 20
 
-# Length of randomly sampled non-interacting peptides
-SAMPLE_LENGTH = 20
-
 # Target number of non-interacting samples
-# This is set to make interacting samples ~1% of the final dataset
-NON_INTERACTING_COUNT = 200_000
+NON_INTERACTING_COUNT = 500_000
 
 
 def get_db_connection():
@@ -132,7 +129,7 @@ def get_viral_sequences(cursor):
     
     Returns:
         list: List of (accession, sequence) tuples for viral proteins
-              Only includes proteins with sequences >= SAMPLE_LENGTH
+              Only includes proteins with sequences >= MIN_PEPTIDE_LENGTH
     """
     # First, get the latest current_version
     cursor.execute("SELECT MAX(current_version) FROM proteins_versions")
@@ -156,80 +153,95 @@ def get_viral_sequences(cursor):
         if sequences and accession in sequences:
             seq = sequences[accession]
             # Only include if sequence is long enough to sample from
-            if len(seq) >= SAMPLE_LENGTH:
+            if len(seq) >= MIN_PEPTIDE_LENGTH:
                 viral_sequences.append((accession, seq))
 
     return viral_sequences
 
 
-def sample_non_interacting(viral_sequences, interacting_peptides, count, verbose=False):
+def compute_length_distribution(interacting_pairs):
+    """
+    Compute the length distribution of interacting peptide sequences.
+    
+    Args:
+        interacting_pairs: Set of (human_accession, peptide_sequence) tuples
+    
+    Returns:
+        tuple: (lengths list, probabilities list) for use with random.choices()
+    """
+    from collections import Counter
+    
+    length_counts = Counter(len(peptide) for _, peptide in interacting_pairs)
+    
+    # Sort by length for reproducibility
+    lengths = sorted(length_counts.keys())
+    counts = [length_counts[l] for l in lengths]
+    total = sum(counts)
+    probs = [c / total for c in counts]
+    
+    return lengths, probs
+
+
+def sample_non_interacting(viral_sequences, interacting_peptides, count, length_distribution, verbose=False):
     """
     Randomly sample non-interacting peptide sequences from viral proteins.
     
     Sampling strategy:
-    1. Distribute samples evenly across all viral proteins
-       - Each protein gets (count / num_proteins) samples
-       - Remainder is distributed to first N proteins
-    2. For each protein, randomly select start positions and extract 20aa windows
+    1. For each sample, pick a length according to the interacting length distribution
+    2. Randomly select a viral protein and extract a substring of that length
     3. Reject any peptide that matches a known interacting sequence
-    4. If a protein can't provide enough samples, fill from random proteins
+    
+    This ensures non-interacting samples have the same length distribution as
+    interacting samples, preventing the model from using length as a discriminative feature.
     
     Args:
         viral_sequences: List of (accession, sequence) tuples
         interacting_peptides: Set of peptide sequences to exclude
         count: Target number of non-interacting samples
+        length_distribution: Tuple of (lengths, probabilities) from compute_length_distribution()
         verbose: Whether to print progress to stderr
     
     Returns:
         set: Set of unique non-interacting peptide sequences
     """
-    # Calculate total possible sampling positions across all proteins
-    total_positions = sum(len(seq) - SAMPLE_LENGTH + 1 for _, seq in viral_sequences)
-
+    lengths, probs = length_distribution
+    
     if verbose:
         import sys
         print(f"Total viral proteins: {len(viral_sequences)}", file=sys.stderr)
-        print(f"Total sample positions: {total_positions}", file=sys.stderr)
+        print(f"Length distribution: {dict(zip(lengths, [f'{p:.1%}' for p in probs]))}", file=sys.stderr)
 
-    # Distribute samples evenly across proteins
-    samples_per_protein = count // len(viral_sequences)
-    extra_samples = count % len(viral_sequences)
+    # Pre-filter proteins by length for efficiency
+    # For each possible length, keep only proteins that can provide that length
+    proteins_by_min_length = {}
+    for length in lengths:
+        proteins_by_min_length[length] = [
+            (acc, seq) for acc, seq in viral_sequences if len(seq) >= length
+        ]
 
     non_interacting = set()
     attempts = 0
     max_attempts = count * 10  # Safety limit to prevent infinite loops
 
-    # Phase 1: Sample evenly from each protein
-    for idx, (accession, seq) in enumerate(viral_sequences):
-        # First 'extra_samples' proteins get one additional sample
-        target = samples_per_protein + (1 if idx < extra_samples else 0)
-        protein_samples = 0
-        protein_attempts = 0
-        max_protein_attempts = target * 20
-
-        while protein_samples < target and protein_attempts < max_protein_attempts:
-            protein_attempts += 1
-            attempts += 1
-            
-            # Random position within the sequence
-            pos = random.randint(0, len(seq) - SAMPLE_LENGTH)
-            peptide = seq[pos:pos + SAMPLE_LENGTH]
-
-            # Accept only if not an interacting peptide and not already sampled
-            if peptide not in interacting_peptides and peptide not in non_interacting:
-                non_interacting.add(peptide)
-                protein_samples += 1
-
-        if attempts > max_attempts:
-            break
-
-    # Phase 2: Fill remaining quota from random proteins if needed
     while len(non_interacting) < count and attempts < max_attempts:
         attempts += 1
-        accession, seq = random.choice(viral_sequences)
-        pos = random.randint(0, len(seq) - SAMPLE_LENGTH)
-        peptide = seq[pos:pos + SAMPLE_LENGTH]
+        
+        # Pick a length according to the distribution
+        sample_length = random.choices(lengths, weights=probs, k=1)[0]
+        
+        # Pick a random protein that can provide this length
+        eligible_proteins = proteins_by_min_length[sample_length]
+        if not eligible_proteins:
+            continue
+            
+        accession, seq = random.choice(eligible_proteins)
+        
+        # Random position within the sequence
+        max_pos = len(seq) - sample_length
+        pos = random.randint(0, max_pos)
+        peptide = seq[pos:pos + sample_length]
 
+        # Accept only if not an interacting peptide and not already sampled
         if peptide not in interacting_peptides and peptide not in non_interacting:
             non_interacting.add(peptide)
 
@@ -263,19 +275,27 @@ def generate_dataset(verbose=False):
             print(f"Found {len(interacting_peptides)} unique interacting peptides", file=sys.stderr)
             print("Fetching viral sequences...", file=sys.stderr)
 
-        # Step 2: Get all viral protein sequences at their latest version
+        # Step 2: Compute length distribution from interacting sequences
+        length_distribution = compute_length_distribution(interacting_pairs)
+        
+        if verbose:
+            lengths, probs = length_distribution
+            print(f"Length distribution: min={min(lengths)}, max={max(lengths)}", file=sys.stderr)
+
+        # Step 3: Get all viral protein sequences at their latest version
         viral_sequences = get_viral_sequences(cursor)
 
         if verbose:
-            print(f"Found {len(viral_sequences)} viral proteins with sequences >= {SAMPLE_LENGTH} aa", file=sys.stderr)
+            print(f"Found {len(viral_sequences)} viral proteins with sequences >= {MIN_PEPTIDE_LENGTH} aa", file=sys.stderr)
             print(f"Sampling {NON_INTERACTING_COUNT} non-interacting peptides...", file=sys.stderr)
 
-        # Step 3: Sample non-interacting peptides from viral proteins
+        # Step 4: Sample non-interacting peptides from viral proteins
+        # Uses the same length distribution as interacting sequences
         non_interacting = sample_non_interacting(
-            viral_sequences, interacting_peptides, NON_INTERACTING_COUNT, verbose
+            viral_sequences, interacting_peptides, NON_INTERACTING_COUNT, length_distribution, verbose
         )
 
-        # Step 4: Output the dataset as CSV
+        # Step 5: Output the dataset as CSV
         import csv
         import os
         
@@ -300,7 +320,7 @@ def generate_dataset(verbose=False):
         if verbose:
             print(f"Dataset written to {output_path}", file=sys.stderr)
 
-        # Step 5: Print statistics if verbose
+        # Step 6: Print statistics if verbose
         if verbose:
             total = len(interacting_pairs) + len(non_interacting)
             pct = len(interacting_pairs) / total * 100 if total > 0 else 0

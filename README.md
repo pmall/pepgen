@@ -8,7 +8,7 @@ We want to generate novel peptide sequences (short protein fragments, 4-20 amino
 
 We have two types of training data:
 - **~2,000 known interaction pairs**: Experimentally validated (viral peptide, human protein) pairs from curated databases. Each pair tells us "this specific peptide binds to this specific human protein."
-- **~200,000 random viral sequences**: 20-amino-acid fragments sampled from viral proteins. These have no known interaction with human proteins.
+- **~500,000 random viral sequences**: Variable-length fragments (4-20 AA) sampled from viral proteins. These have no known interaction with human proteins. The length distribution matches the interacting sequences to prevent length-based bias.
 
 ### The Insight
 
@@ -16,7 +16,7 @@ Imagine the space of all possible peptide sequences as a vast landscape. Most se
 
 Our training strategy uses both datasets with distinct purposes:
 
-1. **The 200,000 random sequences teach structure**: The model learns what valid peptide sequences look like - amino acid frequencies, common motifs, structural patterns. This is the "background" of the landscape.
+1. **The 500,000 random sequences teach structure**: The model learns what valid peptide sequences look like - amino acid frequencies, common motifs, structural patterns. This is the "background" of the landscape.
 
 2. **The 2,000 interaction pairs mark the targets**: These samples show the model where the interesting regions are - the sequences that actually bind. Crucially, they also provide the mapping between peptides and their human protein targets.
 
@@ -49,7 +49,7 @@ The model learns to denoise differently based on these conditions - it learns th
 
 The key insight is **conditional generation with imbalanced data**:
 
-- The 200k non-interacting samples provide a strong prior on general peptide structure
+- The 500k non-interacting samples provide a strong prior on general peptide structure
 - The 2k interacting samples, though rare, provide enough signal to learn the distinguishing features
 - Balanced sampling during training ensures the model sees both classes equally despite the 100:1 imbalance
 - At generation time, conditioning on `label=1` biases the output toward the interacting distribution
