@@ -21,8 +21,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pepgen.model import D3PM, PeptideTransformer
-from pepgen.tokenizer import AminoAcidTokenizer
+from mimir.model import D3PM, PeptideTransformer
+from mimir.tokenizer import AminoAcidTokenizer
 
 ROOT_DIR = Path(__file__).parent.parent
 CHECKPOINTS_BASE = ROOT_DIR / "checkpoints"

@@ -1,4 +1,4 @@
-# PepGen - Peptide Generation with Discrete Diffusion
+# Mimir - Peptide Generation with Discrete Diffusion
 
 ## The Approach
 
@@ -277,7 +277,7 @@ Watch for these patterns:
 ## Project Structure
 
 ```
-pepgen/
+mimir/
 ├── data/                   # Dataset (gitignored)
 │   └── dataset.csv         # Generated training data
 ├── checkpoints/            # Model checkpoints (gitignored)
@@ -285,7 +285,7 @@ pepgen/
 │   ├── config.json         # Model configuration
 │   ├── targets.json        # Target protein mapping
 │   └── tokenizer.txt       # Vocabulary
-├── pepgen/                 # Python package
+├── mimir/                  # Python package
 │   ├── __init__.py
 │   ├── tokenizer.py        # Amino acid tokenization (24 tokens)
 │   ├── dataset.py          # PyTorch datasets with balanced sampling

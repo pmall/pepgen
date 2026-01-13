@@ -26,9 +26,9 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pepgen.dataset import BalancedPeptideDataset, PeptideDataset
-from pepgen.model import D3PM, PeptideTransformer
-from pepgen.tokenizer import AminoAcidTokenizer
+from mimir.dataset import BalancedPeptideDataset, PeptideDataset
+from mimir.model import D3PM, PeptideTransformer
+from mimir.tokenizer import AminoAcidTokenizer
 
 ROOT_DIR = Path(__file__).parent.parent
 DATASET_PATH = ROOT_DIR / "data" / "dataset.csv"
