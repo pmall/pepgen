@@ -47,12 +47,13 @@ The model learns to denoise differently based on these conditions - it learns th
 
 ### Why This Works
 
-The key insight is **conditional generation with imbalanced data**:
+The key insight is **conditional generation without class balancing**:
 
-- The 1M background samples provide a strong prior on general peptide structure
-- The 3.5k interacting samples, though rare, provide enough signal to learn the distinguishing features
-- Balanced sampling during training ensures the model sees both classes equally despite the ~300:1 imbalance
-- At generation time, conditioning on `label=1` biases the output toward the interacting distribution
+- The 1M background samples teach the model what valid peptides look like (structure, motifs, patterns)
+- The 3.5k interacting samples provide enough signal to learn what distinguishes interacting sequences
+- Unlike classifiers, diffusion models don't need balanced classes - they learn conditional distributions
+- At generation time, conditioning on `label=1` steers the denoising toward interacting sequence patterns
+- No oversampling means no risk of memorizing the small interacting set
 
 ---
 
@@ -204,7 +205,7 @@ epochs: 150, batch_size: 128, lr: 5e-5, dim: 512, layers: 6, timesteps: 35
 
 | Parameter | Default | Description | Tuning Guidance |
 |-----------|---------|-------------|-----------------|
-| `--epochs` | 75 | Training epochs | With balanced sampling (~2M samples/epoch), 20-150 epochs typical. Watch loss plateau. |
+| `--epochs` | 75 | Training epochs | With ~1M samples/epoch, 20-150 epochs typical. Watch loss plateau. |
 | `--batch-size` | 64 | Batch size | Increase for faster training if VRAM allows. 32-256 typical. |
 | `--lr` | 1e-4 | Learning rate | Higher (2e-4) for small models, lower (5e-5) for large. |
 | `--warmup-steps` | 1000 | LR warmup steps | Prevents early training instability. Scale with dataset size. |
@@ -224,6 +225,12 @@ epochs: 150, batch_size: 128, lr: 5e-5, dim: 512, layers: 6, timesteps: 35
 |-----------|---------|-------------|-----------------|
 | `--hybrid-loss-coeff` | 0.001 | VB loss weight | Weight of variational bound vs cross-entropy. Start with 0, increase to 0.01 if generation quality is poor. |
 
+#### Sampling
+
+| Parameter | Default | Description | Tuning Guidance |
+|-----------|---------|-------------|-----------------|
+| `--balanced` | False | Oversample interacting class | Not recommended. Risks memorizing the 3.5k interacting sequences. |
+
 ### Understanding the Parameters
 
 #### Why `dim` matters
@@ -233,7 +240,7 @@ The embedding dimension controls model capacity. With only ~3,500 positive sampl
 - Sweet spot: 256 for medium, 384-512 for large with regularization
 
 #### Why `epochs` matters
-Each epoch with balanced sampling sees ~2M samples (1M background + 1M oversampled positive). The model needs enough epochs to:
+Each epoch sees ~1M samples (the full dataset). The model needs enough epochs to:
 1. Learn general peptide structure (fast, ~5-10 epochs)
 2. Learn interaction patterns (slower, ~30-50 epochs)
 3. Learn target-specific patterns (slowest, ~75-150 epochs)
@@ -243,6 +250,15 @@ Diffusion timesteps define how many denoising steps are used during generation. 
 - Too many steps (50+): Each step makes tiny changes, noisy gradients, wasted compute
 - Too few steps (5-): Model must make large jumps, may hurt quality
 - Sweet spot: ~2-3× average sequence length (10-35 steps)
+
+#### Why unbalanced sampling (default)
+Unlike classifiers, diffusion models learn conditional distributions `P(sequence | label)`. With unbalanced data:
+- The 1M background samples teach what valid peptides look like
+- The 3.5k interacting samples are enough to learn the conditional signal
+- No oversampling = no memorization risk
+- Conditioning steers generation toward interacting patterns at inference time
+
+The `--balanced` flag is available but not recommended - it oversamples the 3.5k interacting sequences ~285x per epoch, risking memorization instead of generalization.
 
 #### Why `hybrid_loss_coeff` matters
 D3PM uses two loss components:
@@ -292,7 +308,6 @@ Watch for these patterns:
 5. **If underfitting** (poor generation quality):
    - Increase `--epochs` to 100-150
    - Increase `--dim` to 384 or 512
-   - Check that `--balanced` is enabled
 
 ---
 
@@ -309,8 +324,8 @@ mimir/
 │   └── tokenizer.txt       # Vocabulary
 ├── mimir/                  # Python package
 │   ├── __init__.py
-│   ├── tokenizer.py        # Amino acid tokenization (24 tokens)
-│   ├── dataset.py          # PyTorch datasets with balanced sampling
+│   ├── tokenizer.py        # Amino acid tokenization (vocabulary built from dataset)
+│   ├── dataset.py          # PyTorch dataset loading
 │   └── model.py            # D3PM + Transformer architecture
 └── scripts/                # CLI scripts
     ├── generate_dataset.py # Database → CSV dataset

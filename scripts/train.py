@@ -148,13 +148,14 @@ def train(args):
     log(f"  Background: {num_background:,}", args.verbose)
     log(f"  Target proteins: {full_dataset.num_targets}", args.verbose)
 
-    # Balanced sampling to handle class imbalance
+    # Sampling strategy
     if args.balanced:
         dataset = BalancedPeptideDataset(full_dataset, oversample_ratio=1.0)
-        log(f"  Balanced dataset: {len(dataset):,} samples per epoch", args.verbose)
+        log(f"  Balanced sampling: {len(dataset):,} samples per epoch", args.verbose)
+        log("  Warning: high risk of memorizing interacting sequences", args.verbose)
     else:
         dataset = full_dataset
-        log("  Using unbalanced sampling (not recommended)", args.verbose)
+        log(f"  Unbalanced sampling: {len(dataset):,} samples per epoch", args.verbose)
 
     dataloader = DataLoader(
         dataset,
@@ -337,7 +338,7 @@ def add_arguments(parser):
     parser.add_argument("--hybrid-loss-coeff", type=float, default=0.001, help="VB loss weight")
 
     # Sampling
-    parser.add_argument("--balanced", action="store_true", default=True, help="Balanced sampling")
+    parser.add_argument("--balanced", action="store_true", default=False, help="Oversample interacting class (risk of memorization)")
     parser.add_argument("--no-balanced", action="store_false", dest="balanced")
 
     # Checkpoints
