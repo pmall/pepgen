@@ -7,8 +7,8 @@
 We want to generate novel peptide sequences (short protein fragments, 4-20 amino acids) that can interact with specific human proteins. This has applications in drug discovery - finding new peptides that bind to disease-related proteins could lead to new therapeutics.
 
 We have two types of training data:
-- **~2,000 known interaction pairs**: Experimentally validated (viral peptide, human protein) pairs from curated databases. Each pair tells us "this specific peptide binds to this specific human protein."
-- **~500,000 random viral sequences**: Variable-length fragments (4-20 AA) sampled from viral proteins. These have no known interaction with human proteins. The length distribution matches the interacting sequences to prevent length-based bias.
+- **~3,500 known interaction pairs**: Experimentally validated peptide-target pairs from curated databases (both human-human and virus-human interactions). Each pair tells us "this specific peptide binds to this specific human protein."
+- **~1,000,000 background sequences**: Random peptides (4-20 AA) sampled evenly from human proteins (500k) and viral proteins (500k). These have no known interaction with human proteins. The length distribution matches the interacting sequences to prevent length-based bias.
 
 ### The Insight
 
@@ -16,9 +16,9 @@ Imagine the space of all possible peptide sequences as a vast landscape. Most se
 
 Our training strategy uses both datasets with distinct purposes:
 
-1. **The 500,000 random sequences teach structure**: The model learns what valid peptide sequences look like - amino acid frequencies, common motifs, structural patterns. This is the "background" of the landscape.
+1. **The 1M background sequences teach structure**: The model learns what valid peptide sequences look like - amino acid frequencies, common motifs, structural patterns. This is the "background" of the landscape.
 
-2. **The 2,000 interaction pairs mark the targets**: These samples show the model where the interesting regions are - the sequences that actually bind. Crucially, they also provide the mapping between peptides and their human protein targets.
+2. **The 3.5k interaction pairs mark the targets**: These samples show the model where the interesting regions are - the sequences that actually bind. Crucially, they also provide the mapping between peptides and their human protein targets.
 
 ### The Method: Discrete Diffusion (D3PM)
 
@@ -30,15 +30,15 @@ We use **D3PM** (Discrete Denoising Diffusion Probabilistic Models), adapted fro
 2. Gradually corrupt it by randomly replacing amino acids with noise over many steps
 3. Train the model to reverse this process - predict the original sequence from the noisy version
 4. Provide two conditioning signals with each sequence:
-   - **Interaction label**: Is this sequence interacting (1) or non-interacting (0)?
-   - **Target protein ID**: Which human protein does it interact with? (or "unknown" for non-interacting)
+   - **Interaction label**: Is this sequence interacting (1) or background (0)?
+   - **Target protein ID**: Which human protein does it interact with? (or "unknown" for background)
 
-The model learns to denoise differently based on these conditions - it learns the statistical patterns of interacting vs non-interacting sequences, and the patterns specific to each target protein.
+The model learns to denoise differently based on these conditions - it learns the statistical patterns of interacting vs background sequences, and the patterns specific to each target protein.
 
 #### Generation Phase: Guided Exploration
 
 1. Start with pure random noise (random amino acids at each position)
-2. Apply the learned denoising process iteratively (50 steps by default)
+2. Apply the learned denoising process iteratively (25 steps by default)
 3. Condition on desired properties:
    - `label=1` → "Generate an interacting peptide"
    - `target=Q96C01` → "Make it interact with human protein Q96C01"
@@ -49,9 +49,9 @@ The model learns to denoise differently based on these conditions - it learns th
 
 The key insight is **conditional generation with imbalanced data**:
 
-- The 500k non-interacting samples provide a strong prior on general peptide structure
-- The 2k interacting samples, though rare, provide enough signal to learn the distinguishing features
-- Balanced sampling during training ensures the model sees both classes equally despite the 100:1 imbalance
+- The 1M background samples provide a strong prior on general peptide structure
+- The 3.5k interacting samples, though rare, provide enough signal to learn the distinguishing features
+- Balanced sampling during training ensures the model sees both classes equally despite the ~300:1 imbalance
 - At generation time, conditioning on `label=1` biases the output toward the interacting distribution
 
 ---
@@ -72,7 +72,23 @@ cp .env.example .env
 uv run python scripts/generate_dataset.py -v
 ```
 
-### 2. Train Model
+This fetches interaction data from the database and generates `data/dataset.csv` with:
+- Interacting pairs from human-human (hh) and virus-human (vh) interactions
+- Background peptides sampled evenly from human and viral proteins
+
+### 2. Verify Dataset
+
+```bash
+uv run python scripts/verify_dataset.py -v
+```
+
+Checks all dataset constraints:
+- Peptide lengths (4-20 AA)
+- Unique sequences
+- No overlap between background and interacting sets
+- Length distribution matching
+
+### 3. Train Model
 
 ```bash
 # Quick start with recommended preset
@@ -82,10 +98,10 @@ uv run python scripts/train.py --preset medium -v
 uv run python scripts/train.py --preset medium --run-name experiment1 -v
 
 # Or customize parameters
-uv run python scripts/train.py --epochs 300 --dim 384 --run-name custom1 -v
+uv run python scripts/train.py --epochs 100 --dim 384 --run-name custom1 -v
 ```
 
-### 3. Generate Peptides
+### 4. Generate Peptides
 
 ```bash
 # Generate interacting peptides (any target)
@@ -149,9 +165,9 @@ We provide three presets optimized for different scenarios:
 
 | Preset | Use Case | VRAM | Training Time (GPU) | Quality |
 |--------|----------|------|---------------------|---------|
-| `small` | Quick experiments, debugging | <4GB | ~10 min | Lower |
-| `medium` | **Recommended starting point** | ~6GB | ~30-60 min | Good |
-| `large` | Best results, final training | >8GB | ~2-4 hours | Best |
+| `small` | Quick experiments, debugging | <4GB | ~20 min | Lower |
+| `medium` | **Recommended starting point** | ~6GB | ~1-2 hours | Good |
+| `large` | Best results, final training | >8GB | ~4-8 hours | Best |
 
 ```bash
 uv run python scripts/train.py --preset small -v   # Fast experimentation
@@ -163,24 +179,24 @@ uv run python scripts/train.py --preset large -v   # Best quality
 
 #### Small Preset
 ```
-epochs: 50, batch_size: 32, lr: 2e-4, dim: 128, layers: 3, timesteps: 20
+epochs: 20, batch_size: 32, lr: 2e-4, dim: 128, layers: 3, timesteps: 10
 ```
 - **Purpose**: Rapid iteration, testing pipeline, low-resource environments
-- **Trade-offs**: May underfit, lower generation quality, but trains in ~10 min on GPU
+- **Trade-offs**: May underfit, lower generation quality, but trains in ~20 min on GPU
 
 #### Medium Preset (Recommended)
 ```
-epochs: 200, batch_size: 64, lr: 1e-4, dim: 256, layers: 4, timesteps: 50
+epochs: 75, batch_size: 64, lr: 1e-4, dim: 256, layers: 4, timesteps: 25
 ```
 - **Purpose**: Balanced quality and training time
-- **Trade-offs**: Good results for most use cases, reasonable training time
+- **Trade-offs**: Good results for most use cases, ~1-2 hours training
 
 #### Large Preset
 ```
-epochs: 500, batch_size: 128, lr: 5e-5, dim: 512, layers: 6, timesteps: 100
+epochs: 150, batch_size: 128, lr: 5e-5, dim: 512, layers: 6, timesteps: 35
 ```
 - **Purpose**: Maximum quality for final model
-- **Trade-offs**: Slower training, requires more VRAM, risk of overfitting without validation
+- **Trade-offs**: ~4-8 hours training, requires more VRAM, risk of overfitting without validation
 
 ### Parameter Reference
 
@@ -188,7 +204,7 @@ epochs: 500, batch_size: 128, lr: 5e-5, dim: 512, layers: 6, timesteps: 100
 
 | Parameter | Default | Description | Tuning Guidance |
 |-----------|---------|-------------|-----------------|
-| `--epochs` | 100 | Training epochs | With balanced sampling (~400k samples/epoch), 100-500 epochs typical. Watch loss plateau. |
+| `--epochs` | 75 | Training epochs | With balanced sampling (~2M samples/epoch), 20-150 epochs typical. Watch loss plateau. |
 | `--batch-size` | 64 | Batch size | Increase for faster training if VRAM allows. 32-256 typical. |
 | `--lr` | 1e-4 | Learning rate | Higher (2e-4) for small models, lower (5e-5) for large. |
 | `--warmup-steps` | 1000 | LR warmup steps | Prevents early training instability. Scale with dataset size. |
@@ -200,7 +216,7 @@ epochs: 500, batch_size: 128, lr: 5e-5, dim: 512, layers: 6, timesteps: 100
 | `--dim` | 256 | Embedding dimension | Model capacity. 128 (small) → 512 (large). Affects VRAM linearly. |
 | `--num-layers` | 4 | Transformer layers | Depth. 3-6 typical. More layers = more capacity but slower. |
 | `--num-heads` | 4 | Attention heads | Should divide `dim` evenly. 4-8 typical. |
-| `--n-timesteps` | 50 | Diffusion steps | For peptides (20 tokens), 20-100 steps is sufficient. Unlike images, discrete sequences don't need 1000 steps. |
+| `--n-timesteps` | 25 | Diffusion steps | For peptides (avg 8-12 AA), 10-35 steps is optimal. Heuristic: ~2-3× avg sequence length. |
 
 #### Loss Function
 
@@ -211,16 +227,22 @@ epochs: 500, batch_size: 128, lr: 5e-5, dim: 512, layers: 6, timesteps: 100
 ### Understanding the Parameters
 
 #### Why `dim` matters
-The embedding dimension controls model capacity. With only 2,000 positive samples:
+The embedding dimension controls model capacity. With only ~3,500 positive samples:
 - Too large (512+): Risk of memorizing the training data
 - Too small (64-128): May not capture the complexity of interactions
 - Sweet spot: 256 for medium, 384-512 for large with regularization
 
 #### Why `epochs` matters
-Each epoch with balanced sampling sees ~400,000 samples (200k negative + 200k oversampled positive). The model needs enough epochs to:
-1. Learn general peptide structure (fast, ~20 epochs)
-2. Learn interaction patterns (slower, ~100 epochs)
-3. Learn target-specific patterns (slowest, ~200+ epochs)
+Each epoch with balanced sampling sees ~2M samples (1M background + 1M oversampled positive). The model needs enough epochs to:
+1. Learn general peptide structure (fast, ~5-10 epochs)
+2. Learn interaction patterns (slower, ~30-50 epochs)
+3. Learn target-specific patterns (slowest, ~75-150 epochs)
+
+#### Why `n_timesteps` matters
+Diffusion timesteps define how many denoising steps are used during generation. For short peptide sequences (avg 8-12 AA):
+- Too many steps (50+): Each step makes tiny changes, noisy gradients, wasted compute
+- Too few steps (5-): Model must make large jumps, may hurt quality
+- Sweet spot: ~2-3× average sequence length (10-35 steps)
 
 #### Why `hybrid_loss_coeff` matters
 D3PM uses two loss components:
@@ -268,7 +290,7 @@ Watch for these patterns:
    - Increase `--hybrid-loss-coeff` to 0.01
 
 5. **If underfitting** (poor generation quality):
-   - Increase `--epochs` to 300-500
+   - Increase `--epochs` to 100-150
    - Increase `--dim` to 384 or 512
    - Check that `--balanced` is enabled
 
@@ -292,6 +314,7 @@ mimir/
 │   └── model.py            # D3PM + Transformer architecture
 └── scripts/                # CLI scripts
     ├── generate_dataset.py # Database → CSV dataset
+    ├── verify_dataset.py   # Dataset constraint verification
     ├── train.py            # Training with presets
     └── generate.py         # Conditional generation
 ```

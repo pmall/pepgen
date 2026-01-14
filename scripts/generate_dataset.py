@@ -5,52 +5,40 @@ This script generates a dataset of interacting and non-interacting peptide seque
 from a PostgreSQL database containing protein-protein interaction data.
 
 The dataset contains:
-- INTERACTING: Human protein + viral peptide pairs from curated interactions (~2k)
-- NON_INTERACTING: Randomly sampled sequences from viral proteins (~500k)
-  The length distribution (4-20 AA) matches the interacting sequences to prevent bias.
+- INTERACTING (label=1): Human protein + peptide pairs from curated interactions
+  - Virus-Human (vh): mapping2 peptides target accession1 (human)
+  - Human-Human (hh): mapping1 peptides target accession2, mapping2 peptides target accession1
+- BACKGROUND (label=0): Random peptide sequences sampled from:
+  - Human proteins: 500k samples
+  - Viral proteins: 500k samples
 
-Database Schema Overview:
--------------------------
-- dataset: Materialized view containing protein-protein interactions
-  - type: 'hh' (human-human) or 'vh' (virus-human)
-  - accession1: Human protein UniProt accession (always human in vh)
-  - accession2: Viral protein UniProt accession (in vh interactions)
-  - mapping2: JSON array of interaction mappings with peptide sequences
-  - is_obsolete1/is_obsolete2: Whether proteins are obsolete in UniProt
-  - deleted_at: Soft delete timestamp
+Constraints:
+- Peptide lengths: 4-20 amino acids
+- Background peptide lengths follow the distribution of interacting peptides
+- Background peptides are unique and not present in interacting set
+- Background sampling is evenly distributed across proteins (round-robin)
 
-- proteins: Protein records with sequences
-  - type: 'h' (human) or 'v' (viral)
-  - accession: UniProt accession
-  - version: UniProt release version (e.g., '2019_01', '2021_02')
-  - sequences: JSON object mapping accession to amino acid sequence
-
-- proteins_versions: Tracks protein version history
-  - accession: UniProt accession
-  - version: UniProt release when this record was imported
-  - current_version: Latest release where this protein still exists
-  
-  To get the latest proteins, we join proteins with proteins_versions on
-  (accession, version) and filter where current_version = max(current_version).
-  This gives us all proteins that still exist in the latest UniProt release.
+Database Schema:
+- dataset: Materialized view with protein-protein interactions
+- proteins: Protein records with sequences (type 'h' or 'v')
+- proteins_versions: Tracks protein version history for latest version filtering
 """
 
 import argparse
 import os
 import random
+import sys
+from collections import Counter
 
 import psycopg2
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Peptide length constraints
-# Only peptides between 4 and 20 amino acids are considered valid
 MIN_PEPTIDE_LENGTH = 4
 MAX_PEPTIDE_LENGTH = 20
-
-# Target number of non-interacting samples
-NON_INTERACTING_COUNT = 500_000
+HUMAN_BACKGROUND_COUNT = 500_000
+VIRAL_BACKGROUND_COUNT = 500_000
 
 
 def get_db_connection():
@@ -64,22 +52,58 @@ def get_db_connection():
     )
 
 
-def get_interacting_pairs(cursor):
+def extract_peptides_from_mapping(mapping):
     """
-    Fetch all valid virus-human interacting peptide pairs from the database.
-    
-    Query explanation:
-    - type = 'vh': Only virus-human interactions (not human-human)
-    - is_obsolete1/2 = false: Both proteins must still exist in UniProt
-    - deleted_at IS NULL: Interaction hasn't been soft-deleted
-    - mapping2 contains JSON array of peptide mappings for protein2 (viral)
-    
-    Returns:
-        tuple: (unique_combinations set, interacting_peptides set)
-        - unique_combinations: Set of (human_accession, peptide_sequence) tuples
-        - interacting_peptides: Set of all peptide sequences (for exclusion later)
+    Extract valid peptide sequences from a mapping JSON array.
+
+    Yields peptides with length between MIN_PEPTIDE_LENGTH and MAX_PEPTIDE_LENGTH.
     """
-    cursor.execute("""
+    if not mapping:
+        return
+
+    for item in mapping:
+        sequence = item.get("sequence", "")
+        if MIN_PEPTIDE_LENGTH <= len(sequence) <= MAX_PEPTIDE_LENGTH:
+            yield sequence
+
+
+def get_hh_interacting_pairs(cursor):
+    """
+    Fetch human-human interacting peptide pairs.
+
+    For hh interactions:
+    - mapping1 peptides (from protein1) target accession2
+    - mapping2 peptides (from protein2) target accession1
+    """
+    cursor.execute(
+        """
+        SELECT accession1, accession2, mapping1, mapping2
+        FROM dataset
+        WHERE type = 'hh'
+          AND is_obsolete1 = false
+          AND is_obsolete2 = false
+          AND deleted_at IS NULL
+    """
+    )
+
+    pairs = set()
+    for accession1, accession2, mapping1, mapping2 in cursor:
+        for peptide in extract_peptides_from_mapping(mapping1):
+            pairs.add((accession2, peptide))
+        for peptide in extract_peptides_from_mapping(mapping2):
+            pairs.add((accession1, peptide))
+
+    return pairs
+
+
+def get_vh_interacting_pairs(cursor):
+    """
+    Fetch virus-human interacting peptide pairs.
+
+    For vh interactions, mapping2 peptides (from viral protein) target accession1 (human).
+    """
+    cursor.execute(
+        """
         SELECT accession1, mapping2
         FROM dataset
         WHERE type = 'vh'
@@ -88,248 +112,243 @@ def get_interacting_pairs(cursor):
           AND deleted_at IS NULL
           AND mapping2 IS NOT NULL
           AND mapping2::text != '[]'
-    """)
-
-    unique_combinations = set()
-    interacting_peptides = set()
-
-    for row in cursor:
-        human_accession = row[0]
-        mappings = row[1]  # JSON array of mapping objects
-
-        # Each mapping contains a 'sequence' field with the peptide sequence
-        for mapping in mappings:
-            sequence = mapping.get("sequence", "")
-            seq_len = len(sequence)
-
-            # Filter peptides by length (4-20 amino acids)
-            if seq_len < MIN_PEPTIDE_LENGTH or seq_len > MAX_PEPTIDE_LENGTH:
-                continue
-
-            unique_combinations.add((human_accession, sequence))
-            interacting_peptides.add(sequence)
-
-    return unique_combinations, interacting_peptides
-
-
-def get_viral_sequences(cursor):
     """
-    Fetch canonical sequences for all viral proteins at their latest version.
-    
-    Query explanation:
-    - proteins table contains protein records at specific UniProt releases (accession, version)
-    - proteins_versions tracks each protein's lifecycle:
-      - version: the UniProt release when this record was imported
-      - current_version: the latest release where this protein still exists
-    - Join on (accession, version) links each protein to its version metadata
-    - Filter by current_version = latest ensures we get proteins that still exist
-    - type = 'v': Only viral proteins
-    - sequences is a JSON object like {"P0DTC2": "MFVFL..."}
-      where the key is the accession and value is the amino acid sequence
-    
+    )
+
+    pairs = set()
+    for human_accession, mapping2 in cursor:
+        for peptide in extract_peptides_from_mapping(mapping2):
+            pairs.add((human_accession, peptide))
+
+    return pairs
+
+
+def get_all_interacting_pairs(cursor, verbose=False):
+    """
+    Fetch all interacting peptide pairs from both vh and hh interactions.
+
     Returns:
-        list: List of (accession, sequence) tuples for viral proteins
-              Only includes proteins with sequences >= MIN_PEPTIDE_LENGTH
+        tuple: (unique_pairs, unique_peptides)
     """
-    # First, get the latest current_version
+    hh_pairs = get_hh_interacting_pairs(cursor)
+    vh_pairs = get_vh_interacting_pairs(cursor)
+
+    unique_pairs = hh_pairs | vh_pairs
+    unique_peptides = {peptide for _, peptide in unique_pairs}
+
+    if verbose:
+        hh_peptides = {peptide for _, peptide in hh_pairs}
+        vh_peptides = {peptide for _, peptide in vh_pairs}
+        print(
+            f"  Human peptides: {len(hh_peptides)} unique, {len(hh_pairs)} pairs",
+            file=sys.stderr,
+        )
+        print(
+            f"  Viral peptides: {len(vh_peptides)} unique, {len(vh_pairs)} pairs",
+            file=sys.stderr,
+        )
+        print(
+            f"  Total: {len(unique_peptides)} unique, {len(unique_pairs)} pairs",
+            file=sys.stderr,
+        )
+
+    return unique_pairs, unique_peptides
+
+
+def get_protein_sequences(cursor, protein_type):
+    """
+    Fetch canonical sequences for proteins of given type at their latest version.
+
+    Args:
+        protein_type: 'h' for human or 'v' for viral
+
+    Returns:
+        list: List of (accession, sequence) tuples
+    """
     cursor.execute("SELECT MAX(current_version) FROM proteins_versions")
     latest_version = cursor.fetchone()[0]
 
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT p.accession, p.sequences
         FROM proteins p
         JOIN proteins_versions pv ON p.accession = pv.accession AND p.version = pv.version
-        WHERE p.type = 'v'
+        WHERE p.type = %s
           AND pv.current_version = %s
           AND p.sequences IS NOT NULL
-    """, (latest_version,))
+    """,
+        (protein_type, latest_version),
+    )
 
-    viral_sequences = []
-    for row in cursor:
-        accession = row[0]
-        sequences = row[1]  # JSON object: {accession: sequence}
-        
-        # Extract the canonical sequence (keyed by accession)
-        if sequences and accession in sequences:
-            seq = sequences[accession]
-            # Only include if sequence is long enough to sample from
+    sequences = []
+    for accession, seq_data in cursor:
+        if seq_data and accession in seq_data:
+            seq = seq_data[accession]
             if len(seq) >= MIN_PEPTIDE_LENGTH:
-                viral_sequences.append((accession, seq))
+                sequences.append((accession, seq))
 
-    return viral_sequences
+    return sequences
 
 
-def compute_length_distribution(interacting_pairs):
+def compute_length_distribution(peptides):
     """
-    Compute the length distribution of interacting peptide sequences.
-    
-    Args:
-        interacting_pairs: Set of (human_accession, peptide_sequence) tuples
-    
+    Compute length distribution of peptide sequences.
+
     Returns:
-        tuple: (lengths list, probabilities list) for use with random.choices()
+        tuple: (lengths, probabilities) for use with random.choices()
     """
-    from collections import Counter
-    
-    length_counts = Counter(len(peptide) for _, peptide in interacting_pairs)
-    
-    # Sort by length for reproducibility
+    length_counts = Counter(len(p) for p in peptides)
     lengths = sorted(length_counts.keys())
     counts = [length_counts[l] for l in lengths]
     total = sum(counts)
     probs = [c / total for c in counts]
-    
     return lengths, probs
 
 
-def sample_non_interacting(viral_sequences, interacting_peptides, count, length_distribution, verbose=False):
+def sample_background(
+    protein_sequences, exclude_peptides, count, length_distribution, verbose=False
+):
     """
-    Randomly sample non-interacting peptide sequences from viral proteins.
-    
-    Sampling strategy:
-    1. For each sample, pick a length according to the interacting length distribution
-    2. Randomly select a viral protein and extract a substring of that length
-    3. Reject any peptide that matches a known interacting sequence
-    
-    This ensures non-interacting samples have the same length distribution as
-    interacting samples, preventing the model from using length as a discriminative feature.
-    
-    Args:
-        viral_sequences: List of (accession, sequence) tuples
-        interacting_peptides: Set of peptide sequences to exclude
-        count: Target number of non-interacting samples
-        length_distribution: Tuple of (lengths, probabilities) from compute_length_distribution()
-        verbose: Whether to print progress to stderr
-    
-    Returns:
-        set: Set of unique non-interacting peptide sequences
+    Sample background peptides using round-robin across shuffled proteins.
+
+    Ensures even distribution across protein diversity, unique peptides,
+    and length distribution matching interacting peptides.
     """
     lengths, probs = length_distribution
-    
+
+    if not protein_sequences:
+        return set()
+
+    shuffled = list(protein_sequences)
+    random.shuffle(shuffled)
+
+    min_length = min(lengths)
+    eligible = [(acc, seq) for acc, seq in shuffled if len(seq) >= min_length]
+
     if verbose:
-        import sys
-        print(f"Total viral proteins: {len(viral_sequences)}", file=sys.stderr)
-        print(f"Length distribution: {dict(zip(lengths, [f'{p:.1%}' for p in probs]))}", file=sys.stderr)
+        print(
+            f"    {len(eligible)} proteins eligible (len >= {min_length})",
+            file=sys.stderr,
+        )
 
-    # Pre-filter proteins by length for efficiency
-    # For each possible length, keep only proteins that can provide that length
-    proteins_by_min_length = {}
-    for length in lengths:
-        proteins_by_min_length[length] = [
-            (acc, seq) for acc, seq in viral_sequences if len(seq) >= length
-        ]
-
-    non_interacting = set()
+    background = set()
+    proteins_used = set()
+    idx = 0
     attempts = 0
-    max_attempts = count * 10  # Safety limit to prevent infinite loops
+    max_attempts = count * 20
 
-    while len(non_interacting) < count and attempts < max_attempts:
+    while len(background) < count and attempts < max_attempts:
         attempts += 1
-        
-        # Pick a length according to the distribution
+        accession, seq = eligible[idx % len(eligible)]
+        idx += 1
+
         sample_length = random.choices(lengths, weights=probs, k=1)[0]
-        
-        # Pick a random protein that can provide this length
-        eligible_proteins = proteins_by_min_length[sample_length]
-        if not eligible_proteins:
+        if len(seq) < sample_length:
             continue
-            
-        accession, seq = random.choice(eligible_proteins)
-        
-        # Random position within the sequence
-        max_pos = len(seq) - sample_length
-        pos = random.randint(0, max_pos)
-        peptide = seq[pos:pos + sample_length]
 
-        # Accept only if not an interacting peptide and not already sampled
-        if peptide not in interacting_peptides and peptide not in non_interacting:
-            non_interacting.add(peptide)
+        pos = random.randint(0, len(seq) - sample_length)
+        peptide = seq[pos : pos + sample_length]
 
-    return non_interacting
+        if peptide not in exclude_peptides and peptide not in background:
+            background.add(peptide)
+            proteins_used.add(accession)
+
+    if verbose:
+        print(
+            f"    Sampled {len(background)} unique peptides from {len(proteins_used)} proteins",
+            file=sys.stderr,
+        )
+
+    return background
 
 
 def generate_dataset(verbose=False):
-    """
-    Main function to generate the complete dataset.
-    
-    Output format (TSV to stdout):
-        INTERACTING     <human_accession>   <peptide_sequence>
-        NON_INTERACTING                     <peptide_sequence>
-    
-    Statistics (if verbose) go to stderr.
-    """
-    import sys
+    """Generate the complete dataset and write to data/dataset.csv."""
+    import csv
+    from pathlib import Path
 
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
 
-        # Step 1: Get all interacting human-viral peptide pairs
         if verbose:
             print("Fetching interacting pairs...", file=sys.stderr)
 
-        interacting_pairs, interacting_peptides = get_interacting_pairs(cursor)
+        interacting_pairs, interacting_peptides = get_all_interacting_pairs(
+            cursor, verbose
+        )
+        length_distribution = compute_length_distribution(interacting_peptides)
 
         if verbose:
-            print(f"Found {len(interacting_pairs)} interacting pairs", file=sys.stderr)
-            print(f"Found {len(interacting_peptides)} unique interacting peptides", file=sys.stderr)
-            print("Fetching viral sequences...", file=sys.stderr)
+            lengths, _ = length_distribution
+            print(
+                f"Peptide length distribution: min={min(lengths)}, max={max(lengths)}",
+                file=sys.stderr,
+            )
+            print("Fetching protein sequences...", file=sys.stderr)
 
-        # Step 2: Compute length distribution from interacting sequences
-        length_distribution = compute_length_distribution(interacting_pairs)
-        
-        if verbose:
-            lengths, probs = length_distribution
-            print(f"Length distribution: min={min(lengths)}, max={max(lengths)}", file=sys.stderr)
-
-        # Step 3: Get all viral protein sequences at their latest version
-        viral_sequences = get_viral_sequences(cursor)
+        human_sequences = get_protein_sequences(cursor, "h")
+        viral_sequences = get_protein_sequences(cursor, "v")
 
         if verbose:
-            print(f"Found {len(viral_sequences)} viral proteins with sequences >= {MIN_PEPTIDE_LENGTH} aa", file=sys.stderr)
-            print(f"Sampling {NON_INTERACTING_COUNT} non-interacting peptides...", file=sys.stderr)
+            print(f"  Human proteins: {len(human_sequences)}", file=sys.stderr)
+            print(f"  Viral proteins: {len(viral_sequences)}", file=sys.stderr)
+            print(
+                f"Sampling {HUMAN_BACKGROUND_COUNT} background peptides from human proteins...",
+                file=sys.stderr,
+            )
 
-        # Step 4: Sample non-interacting peptides from viral proteins
-        # Uses the same length distribution as interacting sequences
-        non_interacting = sample_non_interacting(
-            viral_sequences, interacting_peptides, NON_INTERACTING_COUNT, length_distribution, verbose
+        human_background = sample_background(
+            human_sequences,
+            interacting_peptides,
+            HUMAN_BACKGROUND_COUNT,
+            length_distribution,
+            verbose,
         )
 
-        # Step 5: Output the dataset as CSV
-        import csv
-        import os
-        
-        from pathlib import Path
-        
+        if verbose:
+            print(
+                f"Sampling {VIRAL_BACKGROUND_COUNT} background peptides from viral proteins...",
+                file=sys.stderr,
+            )
+
+        exclude_from_viral = interacting_peptides | human_background
+        viral_background = sample_background(
+            viral_sequences,
+            exclude_from_viral,
+            VIRAL_BACKGROUND_COUNT,
+            length_distribution,
+            verbose,
+        )
+
+        all_background = human_background | viral_background
+
         data_dir = Path(__file__).parent.parent / "data"
         data_dir.mkdir(exist_ok=True)
         output_path = data_dir / "dataset.csv"
-        
+
         with open(output_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["label", "target", "sequence"])
-            
-            # Interacting pairs: label=1, target=human_accession, sequence=peptide
-            for human_accession, peptide in sorted(interacting_pairs):
-                writer.writerow([1, human_accession, peptide])
-            
-            # Non-interacting: label=0, no target, sequence=peptide
-            for peptide in sorted(non_interacting):
-                writer.writerow([0, "", peptide])
-        
-        if verbose:
-            print(f"Dataset written to {output_path}", file=sys.stderr)
 
-        # Step 6: Print statistics if verbose
+            for target, peptide in sorted(interacting_pairs):
+                writer.writerow([1, target, peptide])
+
+            for peptide in sorted(all_background):
+                writer.writerow([0, "", peptide])
+
         if verbose:
-            total = len(interacting_pairs) + len(non_interacting)
+            total = len(interacting_pairs) + len(all_background)
             pct = len(interacting_pairs) / total * 100 if total > 0 else 0
-            print(file=sys.stderr)
-            print("--- Statistics ---", file=sys.stderr)
+            print(f"\nDataset written to {output_path}", file=sys.stderr)
+            print("\n--- Statistics ---", file=sys.stderr)
             print(f"Interacting pairs: {len(interacting_pairs)}", file=sys.stderr)
-            print(f"Non-interacting samples: {len(non_interacting)}", file=sys.stderr)
-            print(f"Total dataset size: {total}", file=sys.stderr)
-            print(f"Interacting percentage: {pct:.2f}%", file=sys.stderr)
+            print(
+                f"Background: {len(all_background)} (human: {len(human_background)}, viral: {len(viral_background)})",
+                file=sys.stderr,
+            )
+            print(f"Total: {total}", file=sys.stderr)
+            print(f"Interacting: {pct:.2f}%", file=sys.stderr)
 
         cursor.close()
     finally:
@@ -337,9 +356,13 @@ def generate_dataset(verbose=False):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate dataset from PostgreSQL")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Output statistics")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser = argparse.ArgumentParser(description="Generate PPI dataset from PostgreSQL")
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Output statistics"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for reproducibility"
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)

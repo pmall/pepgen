@@ -1,12 +1,12 @@
 """
 Training script for peptide D3PM model.
 
-The model is trained on BOTH interacting and non-interacting sequences:
-- Non-interacting (200k): Teaches general peptide structure
-- Interacting (2k): Marks the target region in latent space
+The model is trained on BOTH interacting and background sequences:
+- Background (~1M): Random peptides from human/viral proteins, teaches general peptide structure
+- Interacting (~3.5k): Curated peptide-target pairs from hh and vh interactions
 
 The model learns to distinguish via two conditions:
-1. Interaction label: interacting (1) vs non-interacting (0)
+1. Interaction label: interacting (1) vs background (0)
 2. Target protein: which human protein the peptide interacts with
 
 Usage:
@@ -36,43 +36,42 @@ CHECKPOINTS_BASE = ROOT_DIR / "checkpoints"
 MAX_LENGTH = 20
 
 # Training presets optimized for different scenarios
-# Note: n_timesteps is kept low (50-100) because peptide sequences are small
-# (max 20 amino acids from a vocabulary of ~20 tokens). Unlike images with
-# millions of continuous pixels, discrete sequences need far fewer diffusion steps.
+# Note: n_timesteps scaled for average peptide length of 8-12 AA.
+# Heuristic: timesteps ≈ avg_length × 2-3. Too many steps = noisy gradients.
 PRESETS = {
     "small": {
-        "description": "Fast experimentation, low memory (<4GB VRAM)",
-        "epochs": 50,
+        "description": "Fast experimentation, low memory (<4GB VRAM), ~20 min",
+        "epochs": 20,
         "batch_size": 32,
         "lr": 2e-4,
         "dim": 128,
         "num_layers": 3,
         "num_heads": 4,
-        "n_timesteps": 20,
+        "n_timesteps": 10,
         "hybrid_loss_coeff": 0.0,
         "warmup_steps": 500,
     },
     "medium": {
-        "description": "Balanced quality/speed, recommended starting point",
-        "epochs": 200,
+        "description": "Balanced quality/speed, recommended, ~1-2 hours",
+        "epochs": 75,
         "batch_size": 64,
         "lr": 1e-4,
         "dim": 256,
         "num_layers": 4,
         "num_heads": 4,
-        "n_timesteps": 50,
+        "n_timesteps": 25,
         "hybrid_loss_coeff": 0.001,
         "warmup_steps": 1000,
     },
     "large": {
-        "description": "Best quality, requires >8GB VRAM, slower training",
-        "epochs": 500,
+        "description": "Best quality, requires >8GB VRAM, ~4-8 hours",
+        "epochs": 150,
         "batch_size": 128,
         "lr": 5e-5,
         "dim": 512,
         "num_layers": 6,
         "num_heads": 8,
-        "n_timesteps": 100,
+        "n_timesteps": 35,
         "hybrid_loss_coeff": 0.01,
         "warmup_steps": 2000,
     },
@@ -144,9 +143,9 @@ def train(args):
     )
 
     num_interacting = sum(1 for s in full_dataset.samples if s["label"] == 1)
-    num_non_interacting = len(full_dataset) - num_interacting
+    num_background = len(full_dataset) - num_interacting
     log(f"  Interacting: {num_interacting:,}", args.verbose)
-    log(f"  Non-interacting: {num_non_interacting:,}", args.verbose)
+    log(f"  Background: {num_background:,}", args.verbose)
     log(f"  Target proteins: {full_dataset.num_targets}", args.verbose)
 
     # Balanced sampling to handle class imbalance
@@ -334,7 +333,7 @@ def add_arguments(parser):
     parser.add_argument("--dim", type=int, default=256, help="Model dimension")
     parser.add_argument("--num-layers", type=int, default=4, help="Transformer layers")
     parser.add_argument("--num-heads", type=int, default=4, help="Attention heads")
-    parser.add_argument("--n-timesteps", type=int, default=50, help="Diffusion steps (20-100 for peptides)")
+    parser.add_argument("--n-timesteps", type=int, default=25, help="Diffusion steps (10-35 for peptides)")
     parser.add_argument("--hybrid-loss-coeff", type=float, default=0.001, help="VB loss weight")
 
     # Sampling
