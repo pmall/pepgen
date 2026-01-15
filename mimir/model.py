@@ -1,7 +1,9 @@
 """
-D3PM (Discrete Denoising Diffusion Probabilistic Model) for peptide generation.
+Diffusion models for peptide generation.
 
-Adapted from https://github.com/cloneofsimo/d3pm for 1D peptide sequences.
+Contains:
+- D3PM: Discrete Denoising Diffusion (for reference/comparison)
+- MaskedDiffusion: MASK-based diffusion with linear masking schedule (preferred)
 """
 
 import math
@@ -518,3 +520,311 @@ class D3PM(nn.Module):
             x = torch.where(pad_mask, torch.full_like(x, pad_idx), x_new)
         
         return x
+
+
+class MaskedDiffusion(nn.Module):
+    """
+    Masked Diffusion Model for peptide generation.
+    
+    MASKED DIFFUSION vs D3PM
+    ------------------------
+    Instead of random token swapping (D3PM), this model uses MASK-based corruption:
+    
+    D3PM:   MKTAY → XYZAB → QWERT (random tokens at each step)
+    MASKED: MKTAY → MK___ → _____ (progressive masking)
+    
+    Benefits:
+    1. Simpler learning task: "fill in the blanks" vs "reverse random swaps"
+    2. BERT-style training: learn context, not just copy visible tokens
+    3. No complex transition matrices: just linear masking schedule
+    
+    LINEAR MASKING SCHEDULE
+    -----------------------
+    The number of masks scales linearly with timestep AND sequence length:
+    
+        num_masks = ceil(t × L / T)
+    
+    Where:
+        t = current timestep (1 to T)
+        L = sequence length
+        T = n_timesteps (should equal max_length, default 20)
+    
+    This ensures:
+        - t=T: fully masked (L masks)
+        - t=0: fully unmasked (target sequence)
+        - Every sequence sees all masking levels from 1 to L
+    
+    Example for L=4, T=20:
+        t ∈ [1-5]:   1 mask (25%)
+        t ∈ [6-10]:  2 masks (50%)
+        t ∈ [11-15]: 3 masks (75%)
+        t ∈ [16-20]: 4 masks (100%)
+    
+    LOSS COMPUTATION
+    ----------------
+    Loss is computed ONLY on masked positions (BERT-style).
+    This forces the model to learn context, not just copy visible tokens.
+    """
+
+    def __init__(
+        self,
+        x0_model: nn.Module,
+        n_timesteps: int = 20,
+        max_length: int = 20,
+        mask_idx: int = 1,
+        pad_idx: int = 0,
+    ):
+        """
+        Initialize MaskedDiffusion model.
+        
+        Args:
+            x0_model: Transformer model that predicts x0 from masked input
+            n_timesteps: Number of diffusion timesteps. Must be >= max_length.
+                        Default 20 (matches typical max peptide length).
+            max_length: Maximum sequence length. Used for validation.
+            mask_idx: Token index for [MASK] (default 1)
+            pad_idx: Token index for [PAD] (default 0)
+        
+        Raises:
+            ValueError: If n_timesteps < max_length
+        """
+        super().__init__()
+        
+        if n_timesteps < max_length:
+            raise ValueError(
+                f"n_timesteps ({n_timesteps}) must be >= max_length ({max_length}). "
+                f"This ensures all mask counts from 1 to {max_length} are trained."
+            )
+        
+        self.x0_model = x0_model
+        self.n_timesteps = n_timesteps
+        self.max_length = max_length
+        self.mask_idx = mask_idx
+        self.pad_idx = pad_idx
+
+    def q_sample(
+        self,
+        x_0: torch.Tensor,
+        t: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward diffusion: mask positions using LINEAR masking schedule.
+        
+        LINEAR MASKING FORMULA
+        ----------------------
+        num_masks = ceil(t × L / T)
+        
+        Where:
+            t = current timestep (1 to T)
+            L = sequence length
+            T = max timesteps (n_timesteps)
+        
+        This ensures:
+            - t=T: L masks (fully masked)
+            - t=0: 0 masks (fully unmasked = target)
+            - Linear interpolation between
+        
+        For a 4-AA sequence with T=20:
+            t ∈ [1-5]:   1 mask (25%)
+            t ∈ [6-10]:  2 masks (50%)
+            t ∈ [11-15]: 3 masks (75%)
+            t ∈ [16-20]: 4 masks (100%)
+        
+        For a 20-AA sequence with T=20:
+            t=1: 1 mask, t=2: 2 masks, ..., t=20: 20 masks (1:1 mapping)
+        
+        Args:
+            x_0: Clean token indices [batch, seq_len]
+            t: Timesteps [batch], values in [1, T]
+            lengths: Actual sequence lengths [batch]
+        
+        Returns:
+            x_t: Masked tokens [batch, seq_len]
+            mask_positions: Boolean mask [batch, seq_len] where True = masked
+        """
+        batch_size, seq_len = x_0.shape
+        device = x_0.device
+        
+        # LINEAR MASKING: num_masks = ceil(t × L / T)
+        # This ensures proper scaling for all sequence lengths
+        num_to_mask = torch.ceil(
+            t.float() * lengths.float() / self.n_timesteps
+        ).long()
+        
+        # Clamp to valid range: at least 1, at most L
+        # Use torch.minimum for tensor max, clamp for scalar min
+        num_to_mask = torch.clamp(num_to_mask, min=1)
+        num_to_mask = torch.minimum(num_to_mask, lengths)
+        
+        # For each sample, randomly select positions to mask
+        # We use a trick: generate random scores, sort, take top-k
+        random_scores = torch.rand(batch_size, seq_len, device=device)
+        
+        # Set PAD positions to -inf so they're never selected for masking
+        pad_mask = torch.arange(seq_len, device=device).unsqueeze(0) >= lengths.unsqueeze(1)
+        random_scores = random_scores.masked_fill(pad_mask, -float('inf'))
+        
+        # Get rank of each position (highest scores first)
+        _, indices = random_scores.sort(dim=1, descending=True)
+        ranks = torch.zeros_like(indices)
+        ranks.scatter_(1, indices, torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1))
+        
+        # Mask positions where rank < num_to_mask
+        mask_positions = ranks < num_to_mask.unsqueeze(1)
+        
+        # Apply masking
+        x_t = torch.where(mask_positions, self.mask_idx, x_0)
+        
+        return x_t, mask_positions
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cond: dict | None = None,
+        lengths: torch.Tensor | None = None,
+        pad_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """
+        Training forward pass.
+        
+        TRAINING PROCEDURE
+        ------------------
+        1. Sample random timestep t for each sequence
+        2. Mask t/T fraction of positions
+        3. Predict original tokens at ALL positions
+        4. Compute CE loss ONLY on MASKED positions
+        
+        WHY LOSS ON MASKED POSITIONS ONLY?
+        ----------------------------------
+        Computing loss on visible tokens would:
+        - Artificially inflate the score (trivial to predict visible tokens)
+        - Make the model lazy (just copy instead of learning context)
+        
+        This is the BERT-style approach: focus on the fill-in-the-blank task.
+        Training takes more epochs but learns better representations.
+        
+        Args:
+            x: Clean token indices [batch, seq_len]
+            cond: Conditioning dict with 'label' and 'target_id'
+            lengths: Actual sequence lengths [batch]
+            pad_mask: Boolean mask [batch, seq_len] where True = PAD
+        
+        Returns:
+            loss: Cross-entropy loss on masked positions only
+            info: Dict with loss value for logging
+        """
+        batch_size, seq_len = x.shape
+        device = x.device
+        
+        # If lengths not provided, compute from pad_mask
+        if lengths is None:
+            if pad_mask is not None:
+                lengths = (~pad_mask).sum(dim=1)
+            else:
+                lengths = torch.full((batch_size,), seq_len, device=device)
+        
+        # Sample random timesteps
+        t = torch.randint(1, self.n_timesteps + 1, (batch_size,), device=device)
+        
+        # Forward diffusion: mask t/T positions
+        x_t, mask_positions = self.q_sample(x, t, lengths)
+        
+        # Predict original tokens from partially masked input
+        logits = self.x0_model(x_t, t, cond, pad_mask=pad_mask)
+        
+        # Compute CE loss ONLY on masked positions
+        # This forces the model to learn context, not just copy visible tokens
+        logits_flat = logits.view(-1, logits.size(-1))  # [batch * seq_len, vocab]
+        targets_flat = x.view(-1)  # [batch * seq_len]
+        mask_flat = mask_positions.view(-1)  # [batch * seq_len]
+        
+        # Select only masked positions for loss
+        masked_logits = logits_flat[mask_flat]
+        masked_targets = targets_flat[mask_flat]
+        
+        if masked_logits.numel() > 0:
+            loss = F.cross_entropy(masked_logits, masked_targets)
+        else:
+            loss = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        return loss, {"ce_loss": loss.item(), "num_masked": mask_flat.sum().item()}
+
+    @torch.no_grad()
+    def sample(
+        self,
+        batch_size: int,
+        lengths: torch.Tensor,
+        cond: dict | None = None,
+        device: str = "cuda",
+    ) -> torch.Tensor:
+        """
+        Generate samples by iteratively unmasking.
+        
+        GENERATION PROCEDURE
+        --------------------
+        1. Start fully masked: x = [MASK, MASK, ..., MASK, PAD, PAD, ...]
+        2. For t = T, T-1, ..., 1:
+           a. Predict all positions: logits = model(x, t)
+           b. Compute confidence for each MASK position
+           c. Unmask ~1/t fraction of remaining masks (highest confidence first)
+        3. Result: fully unmasked sequence
+        
+        Args:
+            batch_size: Number of samples to generate
+            lengths: Target length for each sample [batch_size]
+            cond: Conditioning dict with 'label' and 'target_id'
+            device: Device to generate on
+        
+        Returns:
+            Generated token indices [batch_size, max_len]
+        """
+        lengths = lengths.to(device)
+        max_len = lengths.max().item()
+        
+        # Build pad_mask: True where position >= length
+        positions = torch.arange(max_len, device=device).unsqueeze(0)
+        pad_mask = positions >= lengths.unsqueeze(1)
+        
+        # Initialize: all active positions are MASK, PAD positions are PAD
+        x = torch.full((batch_size, max_len), self.mask_idx, device=device, dtype=torch.long)
+        x = torch.where(pad_mask, self.pad_idx, x)
+        
+        # Track which positions are still masked
+        is_masked = ~pad_mask  # Initially all non-PAD positions are "masked"
+        
+        for t in range(self.n_timesteps, 0, -1):
+            t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            
+            # Predict all positions
+            logits = self.x0_model(x, t_tensor, cond, pad_mask=pad_mask)
+            
+            # Get predicted tokens and confidence (max probability)
+            probs = F.softmax(logits, dim=-1)
+            pred_tokens = probs.argmax(dim=-1)
+            confidence = probs.max(dim=-1).values
+            
+            # Only consider currently masked positions for unmasking
+            confidence = confidence.masked_fill(~is_masked, -float('inf'))
+            
+            # Determine how many to unmask this step
+            # We want to unmask all by the end, so unmask ~remaining/t each step
+            num_still_masked = is_masked.sum(dim=1).float()
+            num_to_unmask = torch.ceil(num_still_masked / t).long()
+            
+            # Unmask highest-confidence positions
+            for i in range(batch_size):
+                if num_to_unmask[i] > 0:
+                    # Get indices of masked positions sorted by confidence
+                    mask_indices = is_masked[i].nonzero(as_tuple=True)[0]
+                    if len(mask_indices) > 0:
+                        conf_at_masked = confidence[i, mask_indices]
+                        _, sorted_idx = conf_at_masked.sort(descending=True)
+                        to_unmask = mask_indices[sorted_idx[:num_to_unmask[i]]]
+                        
+                        # Unmask these positions
+                        x[i, to_unmask] = pred_tokens[i, to_unmask]
+                        is_masked[i, to_unmask] = False
+        
+        return x
+

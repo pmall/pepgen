@@ -1,5 +1,5 @@
 """
-Training script for peptide D3PM model.
+Training script for peptide MaskedDiffusion model.
 
 The model is trained on BOTH interacting and background sequences:
 - Background (~1M): Random peptides from human/viral proteins, teaches general peptide structure
@@ -27,7 +27,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from mimir.dataset import BalancedPeptideDataset, PeptideDataset, create_dynamic_collate_fn
-from mimir.model import D3PM, PeptideTransformer
+from mimir.model import MaskedDiffusion, PeptideTransformer
 from mimir.tokenizer import AminoAcidTokenizer
 
 ROOT_DIR = Path(__file__).parent.parent
@@ -179,8 +179,8 @@ def train(args, explicit_args=None):
         collate_fn=collate_fn,  # Dynamic padding to batch-max length
     )
 
-    # Model
-    log("Building model...", args.verbose)
+    # Model - using MaskedDiffusion instead of D3PM for faster convergence
+    log("Building model (MaskedDiffusion)...", args.verbose)
     x0_model = PeptideTransformer(
         vocab_size=tokenizer.vocab_size,
         max_length=MAX_LENGTH,
@@ -191,14 +191,19 @@ def train(args, explicit_args=None):
         use_label_cond=True,
     )
 
-    d3pm = D3PM(
+    # MaskedDiffusion uses MASK-based corruption instead of D3PM's random swaps:
+    # - Linear masking: num_masks = ceil(t × L / T)
+    # - BERT-style loss: computed only on masked positions
+    # - n_timesteps must be >= max_length (20) for proper training
+    model = MaskedDiffusion(
         x0_model=x0_model,
         n_timesteps=args.n_timesteps,
-        num_classes=tokenizer.vocab_size,
-        hybrid_loss_coeff=args.hybrid_loss_coeff,
+        max_length=MAX_LENGTH,  # Validates n_timesteps >= max_length
+        mask_idx=tokenizer.mask_idx,
+        pad_idx=tokenizer.pad_idx,
     ).to(device)
 
-    num_params = sum(p.numel() for p in d3pm.parameters())
+    num_params = sum(p.numel() for p in model.parameters())
     log(f"  Parameters: {num_params:,}", args.verbose)
 
     # Save config
@@ -210,7 +215,7 @@ def train(args, explicit_args=None):
         "num_heads": args.num_heads,
         "num_targets": full_dataset.num_targets,
         "n_timesteps": args.n_timesteps,
-        "hybrid_loss_coeff": args.hybrid_loss_coeff,
+        "model_type": "masked_diffusion",  # Track which model type
     }
     with open(checkpoints_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -220,7 +225,7 @@ def train(args, explicit_args=None):
         json.dump(full_dataset.target_to_id, f)
 
     # Optimizer with warmup + cosine decay
-    optimizer = torch.optim.AdamW(d3pm.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     total_steps = args.epochs * len(dataloader)
     warmup_steps = getattr(args, "warmup_steps", 1000)
@@ -238,10 +243,9 @@ def train(args, explicit_args=None):
     best_loss = float("inf")
 
     for epoch in range(args.epochs):
-        d3pm.train()
+        model.train()
         epoch_loss = 0.0
         epoch_ce = 0.0
-        epoch_vb = 0.0
         num_batches = 0
 
         pbar = tqdm(
@@ -252,6 +256,7 @@ def train(args, explicit_args=None):
 
         for batch in pbar:
             tokens = batch["tokens"].to(device)
+            lengths = batch["length"].to(device)
             
             # Conditioning signals for the diffusion model
             cond = {
@@ -259,25 +264,20 @@ def train(args, explicit_args=None):
                 "target_id": batch["target_id"].to(device),
             }
             
-            # Padding mask for attention and masked loss calculation
-            # This is critical: it tells the model which positions are PAD
-            # and should be ignored in loss computation
+            # Padding mask for attention masking
             pad_mask = batch["pad_mask"].to(device)
 
-            # Forward pass with masked loss
-            # pad_idx: used for CE loss ignore_index (skip PAD predictions)
-            # pad_mask: used for VB loss masking and attention masking
-            loss, info = d3pm(tokens, cond, pad_idx=tokenizer.pad_idx, pad_mask=pad_mask)
+            # Forward pass: mask t/T positions, predict masked, compute CE loss
+            loss, info = model(tokens, cond, lengths=lengths, pad_mask=pad_mask)
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(d3pm.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
 
             epoch_loss += loss.item()
             epoch_ce += info["ce_loss"]
-            epoch_vb += info["vb_loss"]
             num_batches += 1
 
             pbar.set_postfix(
@@ -287,10 +287,9 @@ def train(args, explicit_args=None):
 
         avg_loss = epoch_loss / num_batches
         avg_ce = epoch_ce / num_batches
-        avg_vb = epoch_vb / num_batches
 
         log(
-            f"Epoch {epoch + 1}: loss={avg_loss:.4f} ce={avg_ce:.4f} vb={avg_vb:.4f}",
+            f"Epoch {epoch + 1}: loss={avg_loss:.4f} ce={avg_ce:.4f}",
             args.verbose,
         )
 
@@ -300,7 +299,7 @@ def train(args, explicit_args=None):
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": d3pm.state_dict(),
+                    "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "loss": best_loss,
                 },
@@ -313,32 +312,30 @@ def train(args, explicit_args=None):
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": d3pm.state_dict(),
+                    "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "loss": avg_loss,
                 },
                 checkpoints_dir / f"checkpoint_{epoch + 1}.pt",
             )
 
-        # Sample generation - showcase template-guided sampling with variable lengths
+        # Sample generation - showcase masked diffusion with variable lengths
         if (epoch + 1) % args.sample_every == 0:
-            d3pm.eval()
+            model.eval()
             log("\nSample generations (variable length 4-20):", args.verbose)
 
             with torch.no_grad():
                 # Generate interacting peptides with random lengths between 4-20
-                # This demonstrates the template-guided sampling capability
                 num_samples = 4
-                lengths = torch.randint(4, 21, (num_samples,))  # Random lengths [4, 20]
+                lengths = torch.randint(4, 21, (num_samples,))
                 
                 cond = {
                     "label": torch.ones(num_samples, dtype=torch.long, device=device),
                     "target_id": torch.full((num_samples,), -1, dtype=torch.long, device=device),
                 }
-                samples = d3pm.sample_with_template(
+                samples = model.sample(
                     batch_size=num_samples,
                     lengths=lengths,
-                    pad_idx=tokenizer.pad_idx,
                     cond=cond,
                     device=device,
                 )
@@ -347,7 +344,6 @@ def train(args, explicit_args=None):
                 for i, s in enumerate(samples):
                     peptide = tokenizer.decode(s.cpu().tolist())
                     log(f"    [{lengths[i].item():2d} AA] {peptide}", args.verbose)
-
 
             log("", args.verbose)
 
@@ -450,7 +446,7 @@ def get_explicit_args(parser, argv=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train peptide D3PM model",
+        description="Train peptide MaskedDiffusion model",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     add_arguments(parser)

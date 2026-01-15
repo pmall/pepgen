@@ -1,5 +1,5 @@
 """
-Generate peptide sequences using trained D3PM model.
+Generate peptide sequences using trained MaskedDiffusion model.
 
 Supports conditioning on:
 - Interaction label (interacting vs non-interacting)
@@ -21,7 +21,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from mimir.model import D3PM, PeptideTransformer
+from mimir.model import MaskedDiffusion, PeptideTransformer
 from mimir.tokenizer import AminoAcidTokenizer
 
 ROOT_DIR = Path(__file__).parent.parent
@@ -29,7 +29,7 @@ CHECKPOINTS_BASE = ROOT_DIR / "checkpoints"
 
 
 def load_model(checkpoint_path: Path, checkpoints_dir: Path, device: str):
-    """Load model from checkpoint."""
+    """Load MaskedDiffusion model from checkpoint."""
     with open(checkpoints_dir / "config.json") as f:
         config = json.load(f)
 
@@ -48,35 +48,33 @@ def load_model(checkpoint_path: Path, checkpoints_dir: Path, device: str):
         use_label_cond=True,
     )
 
-    d3pm = D3PM(
+    model = MaskedDiffusion(
         x0_model=x0_model,
         n_timesteps=config["n_timesteps"],
-        num_classes=config["vocab_size"],
+        max_length=config["max_length"],
+        mask_idx=tokenizer.mask_idx,
+        pad_idx=tokenizer.pad_idx,
     ).to(device)
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    d3pm.load_state_dict(checkpoint["model_state_dict"])
-    d3pm.eval()
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
 
-    return d3pm, tokenizer, target_to_id, config
+    return model, tokenizer, target_to_id, config
 
 
 def generate(args):
     """
     Generate peptides with optional conditioning and length constraints.
     
-    TEMPLATE-GUIDED SAMPLING
-    ------------------------
-    Previously, we used a retry-based approach: generate many peptides and
-    filter to keep only those matching the desired length. This was wasteful.
-    
-    Now we use template-guided sampling:
-    1. Pre-specify the exact length for each peptide
-    2. Initialize a template with noise for active positions, PAD for rest
-    3. Denoise only the active positions, preserving PAD throughout
-    4. Result: 100% of generated peptides match the requested length
-    
-    This eliminates wasted compute and guarantees the output length.
+    MASKED DIFFUSION GENERATION
+    ---------------------------
+    Uses iterative unmasking to generate peptides:
+    1. Start with fully masked sequence: [MASK, MASK, ..., MASK, PAD, PAD, ...]
+    2. For each timestep t = T, T-1, ..., 1:
+       - Predict all positions
+       - Unmask highest-confidence positions
+    3. Result: peptide with exact requested length
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -93,7 +91,7 @@ def generate(args):
         print("Train a model first: uv run python scripts/train.py -v", file=sys.stderr)
         sys.exit(1)
 
-    d3pm, tokenizer, target_to_id, config = load_model(checkpoint_path, checkpoints_dir, device)
+    model, tokenizer, target_to_id, config = load_model(checkpoint_path, checkpoints_dir, device)
 
     # Build conditioning
     label = 1 if args.interacting else 0
@@ -109,12 +107,10 @@ def generate(args):
             print(f"Available targets (first 10): {list(target_to_id.keys())[:10]}", file=sys.stderr)
             sys.exit(1)
 
-    # === TEMPLATE-GUIDED GENERATION ===
     # Sample random lengths for each peptide within the specified range
-    # This replaces the old retry-based approach with deterministic length control
     lengths = torch.randint(
         args.min_length, 
-        args.max_length + 1,  # +1 because randint is exclusive on the upper bound
+        args.max_length + 1,
         (args.num_samples,),
     )
     
@@ -124,15 +120,13 @@ def generate(args):
         "target_id": torch.full((args.num_samples,), target_id_value, dtype=torch.long, device=device),
     }
     
-    # Generate with template-guided sampling
-    # Each peptide will have exactly the length specified in 'lengths'
+    # Generate with masked diffusion
     print(f"# Generating {args.num_samples} peptides (length {args.min_length}-{args.max_length})...", file=sys.stderr)
     
     with torch.no_grad():
-        samples = d3pm.sample_with_template(
+        samples = model.sample(
             batch_size=args.num_samples,
             lengths=lengths,
-            pad_idx=tokenizer.pad_idx,
             cond=cond,
             device=device,
         )
@@ -145,7 +139,7 @@ def generate(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate peptides with D3PM",
+        description="Generate peptides with MaskedDiffusion",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
