@@ -48,8 +48,7 @@ PRESETS = {
         "dim": 128,
         "num_layers": 3,
         "num_heads": 4,
-        "n_timesteps": 10,
-        "hybrid_loss_coeff": 0.0,
+        "n_timesteps": 20,
         "warmup_steps": 500,
     },
     "medium": {
@@ -60,8 +59,7 @@ PRESETS = {
         "dim": 256,
         "num_layers": 4,
         "num_heads": 4,
-        "n_timesteps": 25,
-        "hybrid_loss_coeff": 0.001,
+        "n_timesteps": 20,
         "warmup_steps": 1000,
     },
     "large": {
@@ -72,8 +70,7 @@ PRESETS = {
         "dim": 512,
         "num_layers": 6,
         "num_heads": 8,
-        "n_timesteps": 35,
-        "hybrid_loss_coeff": 0.01,
+        "n_timesteps": 20,
         "warmup_steps": 2000,
     },
 }
@@ -383,11 +380,8 @@ def add_arguments(parser):
     parser.add_argument(
         "--n-timesteps",
         type=int,
-        default=25,
-        help="Diffusion steps (10-35 for peptides)",
-    )
-    parser.add_argument(
-        "--hybrid-loss-coeff", type=float, default=0.001, help="VB loss weight"
+        default=20,
+        help="Diffusion steps (must be >= max_length=20)",
     )
 
     # Sampling

@@ -360,3 +360,4 @@ mimir/
 
 - [D3PM Paper](https://arxiv.org/abs/2107.03006): Structured Denoising Diffusion Models in Discrete State-Spaces (Austin et al., 2021)
 - [d3pm implementation](https://github.com/cloneofsimo/d3pm): Minimal PyTorch D3PM by @cloneofsimo
+- [MDLM Website](https://s-sahoo.com/mdlm/): Masked Diffusion Language Models (Sahoo et al.)
