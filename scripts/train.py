@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from mimir.dataset import BalancedPeptideDataset, PeptideDataset
+from mimir.dataset import BalancedPeptideDataset, PeptideDataset, create_dynamic_collate_fn
 from mimir.model import D3PM, PeptideTransformer
 from mimir.tokenizer import AminoAcidTokenizer
 
@@ -84,7 +84,7 @@ def log(msg: str, verbose: bool = True):
         print(msg, file=sys.stderr)
 
 
-def apply_preset(args):
+def apply_preset(args, explicit_args):
     """Apply preset configuration if specified."""
     if args.preset:
         if args.preset not in PRESETS:
@@ -96,26 +96,19 @@ def apply_preset(args):
         for key, value in preset.items():
             if key == "description":
                 continue
-            # Only apply preset value if user didn't override
+            # Only apply preset value if user didn't explicitly set it
             arg_key = key.replace("-", "_")
-            if getattr(args, arg_key, None) == getattr(
-                get_default_args(), arg_key, None
-            ):
+            if arg_key not in explicit_args:
                 setattr(args, arg_key, value)
 
     return args
 
 
-def get_default_args():
-    """Get default argument values for comparison."""
-    parser = argparse.ArgumentParser()
-    add_arguments(parser)
-    return parser.parse_args([])
-
-
-def train(args):
+def train(args, explicit_args=None):
     # Apply preset if specified
-    args = apply_preset(args)
+    if explicit_args is None:
+        explicit_args = set()
+    args = apply_preset(args, explicit_args)
 
     # Set up checkpoint directory
     if args.run_name:
@@ -157,7 +150,13 @@ def train(args):
     log(f"  Target proteins: {full_dataset.num_targets}", args.verbose)
 
     # Sampling strategy
-    if args.balanced:
+    if args.overfit_test > 0:
+        # Subset for overfit testing
+        from torch.utils.data import Subset
+        indices = list(range(min(args.overfit_test, len(full_dataset))))
+        dataset = Subset(full_dataset, indices)
+        log(f"  OVERFIT TEST: {len(dataset)} samples only", args.verbose)
+    elif args.balanced:
         dataset = BalancedPeptideDataset(full_dataset, oversample_ratio=1.0)
         log(f"  Balanced sampling: {len(dataset):,} samples per epoch", args.verbose)
         log("  Warning: high risk of memorizing interacting sequences", args.verbose)
@@ -165,12 +164,19 @@ def train(args):
         dataset = full_dataset
         log(f"  Unbalanced sampling: {len(dataset):,} samples per epoch", args.verbose)
 
+    # DataLoader with dynamic padding
+    # This is a key optimization: instead of padding all sequences to max_length=20,
+    # we pad each batch only to the longest sequence in that batch.
+    # This reduces memory usage and speeds up attention computation.
+    collate_fn = create_dynamic_collate_fn(pad_idx=tokenizer.pad_idx)
+    
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=device == "cuda",
+        collate_fn=collate_fn,  # Dynamic padding to batch-max length
     )
 
     # Model
@@ -246,12 +252,22 @@ def train(args):
 
         for batch in pbar:
             tokens = batch["tokens"].to(device)
+            
+            # Conditioning signals for the diffusion model
             cond = {
                 "label": batch["label"].to(device),
                 "target_id": batch["target_id"].to(device),
             }
+            
+            # Padding mask for attention and masked loss calculation
+            # This is critical: it tells the model which positions are PAD
+            # and should be ignored in loss computation
+            pad_mask = batch["pad_mask"].to(device)
 
-            loss, info = d3pm(tokens, cond)
+            # Forward pass with masked loss
+            # pad_idx: used for CE loss ignore_index (skip PAD predictions)
+            # pad_mask: used for VB loss masking and attention masking
+            loss, info = d3pm(tokens, cond, pad_idx=tokenizer.pad_idx, pad_mask=pad_mask)
 
             optimizer.zero_grad()
             loss.backward()
@@ -304,23 +320,34 @@ def train(args):
                 checkpoints_dir / f"checkpoint_{epoch + 1}.pt",
             )
 
-        # Sample generation
+        # Sample generation - showcase template-guided sampling with variable lengths
         if (epoch + 1) % args.sample_every == 0:
             d3pm.eval()
-            log("\nSample generations:", args.verbose)
+            log("\nSample generations (variable length 4-20):", args.verbose)
 
             with torch.no_grad():
-                # Generate interacting peptides
+                # Generate interacting peptides with random lengths between 4-20
+                # This demonstrates the template-guided sampling capability
+                num_samples = 4
+                lengths = torch.randint(4, 21, (num_samples,))  # Random lengths [4, 20]
+                
                 cond = {
-                    "label": torch.ones(4, dtype=torch.long, device=device),
-                    "target_id": torch.full((4,), -1, dtype=torch.long, device=device),
+                    "label": torch.ones(num_samples, dtype=torch.long, device=device),
+                    "target_id": torch.full((num_samples,), -1, dtype=torch.long, device=device),
                 }
-                samples = d3pm.sample(4, MAX_LENGTH, cond=cond, device=device)
+                samples = d3pm.sample_with_template(
+                    batch_size=num_samples,
+                    lengths=lengths,
+                    pad_idx=tokenizer.pad_idx,
+                    cond=cond,
+                    device=device,
+                )
 
-                log("  Interacting (no target):", args.verbose)
-                for s in samples:
+                log("  Interacting (no target, variable lengths):", args.verbose)
+                for i, s in enumerate(samples):
                     peptide = tokenizer.decode(s.cpu().tolist())
-                    log(f"    {peptide}", args.verbose)
+                    log(f"    [{lengths[i].item():2d} AA] {peptide}", args.verbose)
+
 
             log("", args.verbose)
 
@@ -375,6 +402,12 @@ def add_arguments(parser):
         help="Oversample interacting class (risk of memorization)",
     )
     parser.add_argument("--no-balanced", action="store_false", dest="balanced")
+    parser.add_argument(
+        "--overfit-test",
+        type=int,
+        default=0,
+        help="Train on N samples only (to test if model can overfit)",
+    )
 
     # Checkpoints
     parser.add_argument(
@@ -388,14 +421,42 @@ def add_arguments(parser):
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 
 
+def get_explicit_args(parser, argv=None):
+    """Get set of argument names that were explicitly passed on command line."""
+    import sys
+    if argv is None:
+        argv = sys.argv[1:]
+    
+    explicit = set()
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith('--'):
+            # Extract argument name (handle --arg=value and --arg value)
+            if '=' in arg:
+                name = arg[2:].split('=')[0].replace('-', '_')
+            else:
+                name = arg[2:].replace('-', '_')
+            explicit.add(name)
+        elif arg.startswith('-') and len(arg) == 2:
+            # Short argument like -v
+            for action in parser._actions:
+                if action.option_strings and arg in action.option_strings:
+                    explicit.add(action.dest)
+                    break
+        i += 1
+    return explicit
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train peptide D3PM model",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     add_arguments(parser)
+    explicit_args = get_explicit_args(parser)
     args = parser.parse_args()
-    train(args)
+    train(args, explicit_args)
 
 
 if __name__ == "__main__":

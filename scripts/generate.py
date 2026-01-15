@@ -62,6 +62,22 @@ def load_model(checkpoint_path: Path, checkpoints_dir: Path, device: str):
 
 
 def generate(args):
+    """
+    Generate peptides with optional conditioning and length constraints.
+    
+    TEMPLATE-GUIDED SAMPLING
+    ------------------------
+    Previously, we used a retry-based approach: generate many peptides and
+    filter to keep only those matching the desired length. This was wasteful.
+    
+    Now we use template-guided sampling:
+    1. Pre-specify the exact length for each peptide
+    2. Initialize a template with noise for active positions, PAD for rest
+    3. Denoise only the active positions, preserving PAD throughout
+    4. Result: 100% of generated peptides match the requested length
+    
+    This eliminates wasted compute and guarantees the output length.
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Determine checkpoints directory
@@ -82,7 +98,7 @@ def generate(args):
     # Build conditioning
     label = 1 if args.interacting else 0
 
-    # Resolve target
+    # Resolve target protein
     target_id_value = -1
     if args.target:
         if args.target in target_to_id:
@@ -93,46 +109,37 @@ def generate(args):
             print(f"Available targets (first 10): {list(target_to_id.keys())[:10]}", file=sys.stderr)
             sys.exit(1)
 
-    # Generate with length filtering
-    generated = []
-    attempts = 0
-    max_attempts = args.num_samples * 20  # Retry budget
-
-    while len(generated) < args.num_samples and attempts < max_attempts:
-        batch_size = min(args.num_samples - len(generated), 64)
-        attempts += batch_size
-
-        cond = {
-            "label": torch.full((batch_size,), label, dtype=torch.long, device=device),
-            "target_id": torch.full((batch_size,), target_id_value, dtype=torch.long, device=device),
-        }
-
-        with torch.no_grad():
-            samples = d3pm.sample(
-                batch_size=batch_size,
-                seq_len=config["max_length"],
-                cond=cond,
-                device=device,
-            )
-
-        for sample in samples:
-            peptide = tokenizer.decode(sample.cpu().tolist())
-            length = len(peptide)
-
-            if args.min_length <= length <= args.max_length:
-                generated.append(peptide)
-                if len(generated) >= args.num_samples:
-                    break
-
-    if len(generated) < args.num_samples:
-        print(
-            f"Warning: Only generated {len(generated)}/{args.num_samples} peptides "
-            f"matching length {args.min_length}-{args.max_length}",
-            file=sys.stderr,
+    # === TEMPLATE-GUIDED GENERATION ===
+    # Sample random lengths for each peptide within the specified range
+    # This replaces the old retry-based approach with deterministic length control
+    lengths = torch.randint(
+        args.min_length, 
+        args.max_length + 1,  # +1 because randint is exclusive on the upper bound
+        (args.num_samples,),
+    )
+    
+    # Prepare conditioning tensors
+    cond = {
+        "label": torch.full((args.num_samples,), label, dtype=torch.long, device=device),
+        "target_id": torch.full((args.num_samples,), target_id_value, dtype=torch.long, device=device),
+    }
+    
+    # Generate with template-guided sampling
+    # Each peptide will have exactly the length specified in 'lengths'
+    print(f"# Generating {args.num_samples} peptides (length {args.min_length}-{args.max_length})...", file=sys.stderr)
+    
+    with torch.no_grad():
+        samples = d3pm.sample_with_template(
+            batch_size=args.num_samples,
+            lengths=lengths,
+            pad_idx=tokenizer.pad_idx,
+            cond=cond,
+            device=device,
         )
 
-    # Output
-    for peptide in generated:
+    # Decode and output
+    for sample in samples:
+        peptide = tokenizer.decode(sample.cpu().tolist())
         print(peptide)
 
 
