@@ -49,7 +49,8 @@ PRESETS = {
         "num_layers": 3,
         "num_heads": 4,
         "n_timesteps": 20,
-        "warmup_steps": 500,
+        "warmup_steps": 1000,
+        "curriculum_warmup_epochs": 5,
     },
     "medium": {
         "description": "Balanced quality/speed, recommended",
@@ -60,7 +61,8 @@ PRESETS = {
         "num_layers": 4,
         "num_heads": 4,
         "n_timesteps": 20,
-        "warmup_steps": 1000,
+        "warmup_steps": 2000,
+        "curriculum_warmup_epochs": 10,
     },
     "large": {
         "description": "Best quality, production model",
@@ -72,6 +74,7 @@ PRESETS = {
         "num_heads": 8,
         "n_timesteps": 20,
         "warmup_steps": 2000,
+        "curriculum_warmup_epochs": 15,
     },
 }
 
@@ -191,13 +194,16 @@ def train(args, explicit_args=None):
     # MaskedDiffusion uses MASK-based corruption instead of D3PM's random swaps:
     # - Linear masking: num_masks = ceil(t × L / T)
     # - BERT-style loss: computed only on masked positions
-    # - n_timesteps must be >= max_length (20) for proper training
+    # - Curriculum: t_ceiling rises linearly over warmup epochs
+    # - Weighted loss: (mask_ratio)^α prioritizes generative states
     model = MaskedDiffusion(
         x0_model=x0_model,
         n_timesteps=args.n_timesteps,
         max_length=MAX_LENGTH,  # Validates n_timesteps >= max_length
         mask_idx=tokenizer.mask_idx,
         pad_idx=tokenizer.pad_idx,
+        curriculum_warmup_epochs=args.curriculum_warmup_epochs,
+        loss_weight_alpha=args.loss_weight_alpha,
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters())
@@ -222,15 +228,22 @@ def train(args, explicit_args=None):
         json.dump(full_dataset.target_to_id, f)
 
     # Optimizer with warmup + cosine decay
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    # Weight decay 0.01 regularizes the target/label embeddings
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
 
     total_steps = args.epochs * len(dataloader)
-    warmup_steps = getattr(args, "warmup_steps", 1000)
+    warmup_steps = getattr(args, "warmup_steps", 2000)
+
+    # LR warmup from 1e-7 to target LR (not from 0) to prevent weight explosion
+    min_lr_ratio = 1e-7 / args.lr
 
     def lr_lambda(step):
         if step < warmup_steps:
-            return step / warmup_steps
-        progress = (step - warmup_steps) / (total_steps - warmup_steps)
+            # Linear ramp from min_lr_ratio to 1.0
+            progress = step / warmup_steps
+            return min_lr_ratio + (1.0 - min_lr_ratio) * progress
+        # Cosine decay after warmup
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
         return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)).item())
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -264,8 +277,11 @@ def train(args, explicit_args=None):
             # Padding mask for attention masking
             pad_mask = batch["pad_mask"].to(device)
 
-            # Forward pass: mask t/T positions, predict masked, compute CE loss
-            loss, info = model(tokens, cond, lengths=lengths, pad_mask=pad_mask)
+            # Forward pass with curriculum masking and weighted loss
+            loss, info = model(
+                tokens, cond, lengths=lengths, pad_mask=pad_mask,
+                epoch=epoch, max_epochs=args.epochs
+            )
 
             optimizer.zero_grad()
             loss.backward()
@@ -280,6 +296,7 @@ def train(args, explicit_args=None):
             pbar.set_postfix(
                 loss=f"{loss.item():.4f}",
                 ce=f"{info['ce_loss']:.4f}",
+                t_ceil=info["t_ceiling"],
             )
 
         avg_loss = epoch_loss / num_batches
@@ -369,7 +386,7 @@ def add_arguments(parser):
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument(
-        "--warmup-steps", type=int, default=1000, help="LR warmup steps"
+        "--warmup-steps", type=int, default=2000, help="LR warmup steps (from 1e-7 to target LR)"
     )
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
 
@@ -382,6 +399,18 @@ def add_arguments(parser):
         type=int,
         default=20,
         help="Diffusion steps (must be >= max_length=20)",
+    )
+    parser.add_argument(
+        "--curriculum-warmup-epochs",
+        type=int,
+        default=10,
+        help="Epochs to ramp t_ceiling from 1 to T (curriculum masking)",
+    )
+    parser.add_argument(
+        "--loss-weight-alpha",
+        type=float,
+        default=1.5,
+        help="Exponent for mask-ratio loss weighting (0 = no weighting)",
     )
 
     # Sampling

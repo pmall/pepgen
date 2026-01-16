@@ -203,10 +203,23 @@ class MaskedDiffusion(nn.Module):
         t ∈ [11-15]: 3 masks (75%)
         t ∈ [16-20]: 4 masks (100%)
     
-    LOSS COMPUTATION
-    ----------------
-    Loss is computed ONLY on masked positions (BERT-style).
-    This forces the model to learn context, not just copy visible tokens.
+    CURRICULUM MASKING
+    ------------------
+    Training starts with easy tasks (low t = few masks) and gradually increases
+    difficulty. The ceiling on t rises linearly over warmup epochs:
+    
+        t_ceiling = 1 + (T - 1) × min(epoch / warmup_epochs, 1)
+    
+    This helps the model learn local patterns before tackling full reconstruction.
+    
+    WEIGHTED LOSS
+    -------------
+    High-noise states (more masks) receive higher gradient weight:
+    
+        weighted_loss = CE × (mask_ratio)^α
+    
+    With α=1.5, fully masked sequences get ~1.5x more gradient than half-masked.
+    This prioritizes the harder generative task over easy local predictions.
     """
 
     def __init__(
@@ -216,6 +229,8 @@ class MaskedDiffusion(nn.Module):
         max_length: int = 20,
         mask_idx: int = 1,
         pad_idx: int = 0,
+        curriculum_warmup_epochs: int = 10,
+        loss_weight_alpha: float = 1.5,
     ):
         """
         Initialize MaskedDiffusion model.
@@ -227,6 +242,8 @@ class MaskedDiffusion(nn.Module):
             max_length: Maximum sequence length. Used for validation.
             mask_idx: Token index for [MASK] (default 1)
             pad_idx: Token index for [PAD] (default 0)
+            curriculum_warmup_epochs: Epochs to ramp t_ceiling from 1 to T
+            loss_weight_alpha: Exponent for mask-ratio weighting (0 = no weighting)
         
         Raises:
             ValueError: If n_timesteps < max_length
@@ -244,6 +261,8 @@ class MaskedDiffusion(nn.Module):
         self.max_length = max_length
         self.mask_idx = mask_idx
         self.pad_idx = pad_idx
+        self.curriculum_warmup_epochs = curriculum_warmup_epochs
+        self.loss_weight_alpha = loss_weight_alpha
 
     def q_sample(
         self,
@@ -327,35 +346,32 @@ class MaskedDiffusion(nn.Module):
         cond: dict | None = None,
         lengths: torch.Tensor | None = None,
         pad_mask: torch.Tensor | None = None,
+        epoch: int = 0,
+        max_epochs: int = 1,
     ) -> tuple[torch.Tensor, dict]:
         """
-        Training forward pass.
+        Training forward pass with curriculum masking and weighted loss.
         
         TRAINING PROCEDURE
         ------------------
-        1. Sample random timestep t for each sequence
-        2. Mask t/T fraction of positions
-        3. Predict original tokens at ALL positions
-        4. Compute CE loss ONLY on MASKED positions
-        
-        WHY LOSS ON MASKED POSITIONS ONLY?
-        ----------------------------------
-        Computing loss on visible tokens would:
-        - Artificially inflate the score (trivial to predict visible tokens)
-        - Make the model lazy (just copy instead of learning context)
-        
-        This is the BERT-style approach: focus on the fill-in-the-blank task.
-        Training takes more epochs but learns better representations.
+        1. Compute t_ceiling based on curriculum (epoch / warmup_epochs)
+        2. Sample random timestep t ∈ [1, t_ceiling]
+        3. Mask t/T fraction of positions
+        4. Predict original tokens at ALL positions
+        5. Compute CE loss ONLY on MASKED positions
+        6. Weight loss by (mask_ratio)^α to prioritize generative states
         
         Args:
             x: Clean token indices [batch, seq_len]
             cond: Conditioning dict with 'label' and 'target_id'
             lengths: Actual sequence lengths [batch]
             pad_mask: Boolean mask [batch, seq_len] where True = PAD
+            epoch: Current training epoch (0-indexed)
+            max_epochs: Total number of training epochs
         
         Returns:
-            loss: Cross-entropy loss on masked positions only
-            info: Dict with loss value for logging
+            loss: Weighted cross-entropy loss on masked positions
+            info: Dict with loss values for logging
         """
         batch_size, seq_len = x.shape
         device = x.device
@@ -367,8 +383,13 @@ class MaskedDiffusion(nn.Module):
             else:
                 lengths = torch.full((batch_size,), seq_len, device=device)
         
-        # Sample random timesteps
-        t = torch.randint(1, self.n_timesteps + 1, (batch_size,), device=device)
+        # Curriculum: t_ceiling rises linearly from 1 to T over warmup epochs
+        curriculum_progress = min(epoch / max(self.curriculum_warmup_epochs, 1), 1.0)
+        t_ceiling = int(1 + (self.n_timesteps - 1) * curriculum_progress)
+        t_ceiling = max(1, min(t_ceiling, self.n_timesteps))
+        
+        # Sample random timesteps up to curriculum ceiling
+        t = torch.randint(1, t_ceiling + 1, (batch_size,), device=device)
         
         # Forward diffusion: mask t/T positions
         x_t, mask_positions = self.q_sample(x, t, lengths)
@@ -377,7 +398,6 @@ class MaskedDiffusion(nn.Module):
         logits = self.x0_model(x_t, t, cond, pad_mask=pad_mask)
         
         # Compute CE loss ONLY on masked positions
-        # This forces the model to learn context, not just copy visible tokens
         logits_flat = logits.view(-1, logits.size(-1))  # [batch * seq_len, vocab]
         targets_flat = x.view(-1)  # [batch * seq_len]
         mask_flat = mask_positions.view(-1)  # [batch * seq_len]
@@ -387,11 +407,34 @@ class MaskedDiffusion(nn.Module):
         masked_targets = targets_flat[mask_flat]
         
         if masked_logits.numel() > 0:
-            loss = F.cross_entropy(masked_logits, masked_targets)
+            ce_loss = F.cross_entropy(masked_logits, masked_targets)
+            
+            # Compute mask ratio for logging
+            num_masked = mask_positions.sum(dim=1).float()  # [batch]
+            mask_ratios = num_masked / lengths.float()  # [batch]
+            avg_mask_ratio = mask_ratios.mean()
+            
+            # Weighted penalty: only apply after curriculum warmup
+            # During warmup, curriculum controls difficulty; after, weighting prioritizes hard tasks
+            if epoch >= self.curriculum_warmup_epochs and self.loss_weight_alpha > 0:
+                weight = avg_mask_ratio ** self.loss_weight_alpha
+                loss = ce_loss * weight
+            else:
+                weight = 1.0
+                loss = ce_loss
         else:
+            ce_loss = torch.tensor(0.0, device=device)
             loss = torch.tensor(0.0, device=device, requires_grad=True)
+            avg_mask_ratio = torch.tensor(0.0, device=device)
+            weight = 1.0
         
-        return loss, {"ce_loss": loss.item(), "num_masked": mask_flat.sum().item()}
+        return loss, {
+            "ce_loss": ce_loss.item(),
+            "weighted_loss": loss.item(),
+            "mask_ratio": avg_mask_ratio.item() if isinstance(avg_mask_ratio, torch.Tensor) else avg_mask_ratio,
+            "t_ceiling": t_ceiling,
+            "num_masked": mask_flat.sum().item(),
+        }
 
     @torch.no_grad()
     def sample(
